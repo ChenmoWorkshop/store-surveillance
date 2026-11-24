@@ -47,6 +47,15 @@
 - 数据库：容器内 `/var/lib/monitor/monitor.db`（**无持久卷**）
 - 访问：HTTP Basic Auth，账号密码由负责人持有
 
+### 仓库与写权限
+
+- 地址：https://github.com/ChenmoWorkshop/store-surveillance ，**公开仓库，任何人可读、可 fork**
+- 写权限必须逐个授权：GitHub 个人仓库没有「所有人都能推」的开关，只能由仓库主邀请协作者
+- 当前协作者：`codermax1`（**write**，2026-11-24 邀请）。write 可推送代码、建分支、开 PR；不能改仓库设置、不能删仓库、不能再邀请他人
+- `master` 分支**未设保护**，协作者可以直接 `git push origin master`；如果以后要走评审，去 Settings → Branches 加一条保护规则，改成只能通过 PR 合并
+- 加人的办法（仓库主执行）：`gh api -X PUT repos/ChenmoWorkshop/store-surveillance/collaborators/<用户名> -f permission=push`，对方在邮件或 https://github.com/ChenmoWorkshop/store-surveillance/invitations 里点接受后生效
+- 人多了建议把仓库转到 GitHub 组织（Organization），用 Team 统一管权限
+
 ---
 
 ## 3. 接手第一天
@@ -68,6 +77,8 @@ python -m venv .venv
 #    docs/OPERATIONS.md 发布与排障
 #    本文件第 4 节      未完成事项
 ```
+
+先确认仓库邀请已接受（邮件里点 accept，或打开仓库的 invitations 页面），否则只能读不能推。
 
 然后向负责人要以下信息（**仓库里没有，也不应该有**）：
 
