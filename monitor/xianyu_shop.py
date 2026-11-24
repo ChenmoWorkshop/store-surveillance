@@ -3,7 +3,7 @@
 The desktop storefront (``www.goofish.com/personal?userId=...``) is readable
 without an account and exposes two mtop interfaces that carry everything a
 store monitor needs: the header (display name, active listing count) and the
-first page of listings. Datacenter IPs are risk-controlled on the plain HTTPS
+paginated listings. Datacenter IPs are risk-controlled on the plain HTTPS
 path, so the calls run inside a browser context that already carries the
 fingerprint cookies computed by the page itself.
 """
@@ -16,6 +16,7 @@ from decimal import Decimal, InvalidOperation
 import urllib.parse
 
 from . import xy_browser
+from .models import MAX_CATALOG_ITEMS
 
 PC_APP_KEY = "34839810"
 HEAD_API = "mtop.idle.web.user.page.head"
@@ -88,7 +89,7 @@ def _fen(text):
     return fen if 0 <= fen <= 10**10 else None
 
 
-def parse(uid, head, listing):
+def parse_head(uid, head):
     base_info = (head.get("data") or {}).get("baseInfo") or {}
     if str(base_info.get("kcUserId")) != uid:
         raise ValueError("闲鱼卖家主页返回的账号不匹配")
@@ -97,32 +98,77 @@ def parse(uid, head, listing):
     number = ((module.get("tabs") or {}).get("item") or {}).get("number")
     if type(number) is not int or not 0 <= number <= 10**6:
         raise ValueError("闲鱼卖家主页未返回在售数量")
+    return name, number
 
-    items, seen = [], set()
-    for card in (listing.get("data") or {}).get("cardList") or []:
+
+def listing_items(page):
+    items = {}
+    for card in page.get("cardList") or []:
         data = card.get("cardData") or {}
         item_id = str(data.get("id") or "")
         title = data.get("title")
-        if not ITEM_ID.fullmatch(item_id) or item_id in seen:
+        if not ITEM_ID.fullmatch(item_id) or item_id in items:
             continue
         if not isinstance(title, str) or not title.strip():
             continue
-        seen.add(item_id)
         price = _fen((data.get("priceInfo") or {}).get("price"))
         if price is None:
             price = _fen((data.get("detailParams") or {}).get("soldPrice"))
-        items.append({"id": item_id, "title": title.strip()[:200], "price_fen": price})
+        items[item_id] = {"id": item_id, "title": title.strip()[:200], "price_fen": price}
+    return items
+
+
+def listing_query(uid, page, group=None, previous=None):
+    query = {"pageNumber": page, "userId": uid, "pageSize": PAGE_SIZE}
+    if page == 1 and group is None:
+        query["needGroupInfo"] = True
+    if group:
+        query.update({key: group[key] for key in ("groupId", "groupName", "defaultGroup") if key in group})
+    if previous:
+        query.update({key: previous[key] for key in ("nextPageModel", "nextPageNum")
+                      if previous.get(key) is not None})
+    return query
+
+
+def collect_catalog(uid, head, listing, fetch_page):
+    name, number = parse_head(uid, head)
+    deadline = time.monotonic() + 35
+    page_data = listing["data"]
+    groups = page_data.get("itemGroupList") or []
+    active_group = next((group for group in groups if group.get("groupName") == "在售"), None)
+    group = next((group for group in groups if group.get("groupName") == "综合"), None)
+    if active_group and group and group.get("itemNumber") != active_group.get("itemNumber"):
+        group = active_group
+        page_data = fetch_page(listing_query(uid, 1, group))["data"]
+    items = listing_items(page_data)
     if number and not items:
         raise ValueError("闲鱼卖家页未返回在售商品清单")
 
-    has_more = (listing.get("data") or {}).get("nextPage")
+    for page in range(2, MAX_CATALOG_ITEMS // PAGE_SIZE + 1):
+        more = page_data.get("nextPage")
+        if more is False or (more is not True and len(items) >= number):
+            break
+        if len(items) >= MAX_CATALOG_ITEMS or time.monotonic() >= deadline:
+            break
+        try:
+            next_data = fetch_page(listing_query(uid, page, group, page_data))["data"]
+            received = listing_items(next_data)
+        except (AttributeError, KeyError, TypeError, RuntimeError):
+            break
+        if not received.keys() - items.keys():
+            break
+        for key, item in received.items():
+            if len(items) >= MAX_CATALOG_ITEMS:
+                break
+            items.setdefault(key, item)
+        page_data = next_data
     return {
         "external_id": uid,
         "shop_name": name or None,
         "shop_catalog": {
             "active_count": number,
-            "items": items,
-            "has_more": has_more if type(has_more) is bool else None,
+            "items": list(items.values()),
+            "has_more": page_data.get("nextPage") is True or len(items) != number,
         },
     }
 
@@ -165,16 +211,19 @@ def read_shop(target):
                         break
                     page.wait_for_timeout(500)
                 head = captured.get(HEAD_API) or _call(context, HEAD_API, {"self": False, "userId": uid})
-                listing = captured.get(LIST_API) or _call(
-                    context, LIST_API,
-                    {"needGroupInfo": True, "pageNumber": 1, "userId": uid, "pageSize": PAGE_SIZE},
-                )
-                return parse(uid, head, listing)
+                def fetch_page(query):
+                    try:
+                        return _call(context, LIST_API, query)
+                    except Error as error:
+                        raise RuntimeError("闲鱼卖家商品列表请求失败") from error
+
+                listing = captured.get(LIST_API) or fetch_page(listing_query(uid, 1))
+                return collect_catalog(uid, head, listing, fetch_page)
             finally:
                 browser.close()
     except TimeoutError as error:
         raise RuntimeError("闲鱼卖家页加载超时，未取得本次读数") from error
     except Error as error:
         raise RuntimeError(f"闲鱼卖家页读取失败：{str(error)[:80]}") from error
-    except ValueError as error:
+    except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError(f"闲鱼卖家页返回的数据不可用：{str(error)[:80]}") from error

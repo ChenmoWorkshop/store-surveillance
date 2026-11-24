@@ -6,6 +6,9 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+MAX_CATALOG_ITEMS = 2000
+
+
 class CatalogItem(BaseModel):
     id: str = Field(pattern=r"^(?:[0-9]{5,24}|[a-f0-9]{24})$")
     title: str = Field(min_length=1, max_length=200)
@@ -16,7 +19,7 @@ class CatalogItem(BaseModel):
 
 class ShopCatalog(BaseModel):
     active_count: int = Field(ge=0, le=1000000, strict=True)
-    items: list[CatalogItem] = Field(max_length=2000)
+    items: list[CatalogItem] = Field(max_length=MAX_CATALOG_ITEMS)
     has_more: bool | None = None
 
     @model_validator(mode="after")

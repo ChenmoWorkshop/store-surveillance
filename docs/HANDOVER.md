@@ -35,10 +35,10 @@
 |---|---|---|
 | 闲鱼商品（云端） | ❌ 失败 | 机房 IP 被 mtop 风控（`RGV587`），需配置出口代理 |
 | 闲鱼商品（本地/家宽） | ✅ | 直连即可 |
-| 店铺翻页 | ❌ 未实现 | 只取首批（闲鱼 20 条 / 小红书 6 条），`nextPage` 已读未用 |
+| 店铺翻页 | ✅ 本地已验证 | 闲鱼 36/36、小红书 24/24，CSV 行数一致。云端待验证 |
 | 数据持久化 | ❌ 未配 | 无持久卷，每次发布清库 |
 | 多用户/权限 | ❌ 未实现 | 单账号 Basic Auth |
-| 自动化测试（前端/采集） | ❌ 缺 | 只有 24 条后端单测 |
+| 自动化测试（前端/采集） | ⚠️ 部分覆盖 | 后端单测覆盖店铺分页和 CSV 导出，前端无自动化测试 |
 
 ### 线上实例
 
@@ -64,7 +64,7 @@
 # 1. 装环境
 python -m venv .venv
 & ./.venv/Scripts/python.exe -m pip install -r requirements.txt
-& ./.venv/Scripts/python.exe -m unittest discover -s tests -q     # 应当 24 条全过
+& ./.venv/Scripts/python.exe -m unittest discover -s tests -q
 
 # 2. 跑起来
 ./start.ps1                                                       # http://127.0.0.1:8765
@@ -108,12 +108,10 @@ python -m venv .venv
 - 方案 B：把闲鱼商品也改成读 `www.goofish.com/item?id=` 的 PC 页面接口（店铺通道在机房是通的，商品页可能同理）——**这条尚未验证**，值得先花半小时用 `/admin/probe` 试
 - 验收：`/api/v1/targets/<id>/refresh` 返回成功，`want_count` 有值
 
-### P1 · 店铺翻页补齐清单
+### P1 · 云端验证店铺分页
 
-- 位置：`monitor/xianyu_shop.py`（`PAGE_SIZE = 20`，`nextPage` 已读未用）、`monitor/xhs_public.py`
-- 做法：按 `nextPage` / `hasMore` 循环请求，合并去重后写入 `shop_catalogs.items`，`has_more` 置 false
-- 注意：`ShopCatalog.items` 上限 2000，`unique_items` 校验会拒绝重复 ID
-- 验收：闲鱼店铺 36 条、小红书店铺 24 条全部采到，详情页不再显示「尚缺 N 条」
+- 本地已验证 `monitor/xianyu_shop.py` 和 `monitor/xhs_public.py` 的分页采集。两平台都核对去重条数与在售数。闲鱼还检查末页标记，小红书也可用分页接口总数确认采齐。单次上限 2,000 件。
+- 发布后用星月小铺和文行文化再次核对平台在售数、已采条数和 CSV 行数。
 
 ### P2 · 调度去硬编码
 

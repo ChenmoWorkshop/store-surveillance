@@ -6,7 +6,7 @@
   <title>链接监控台</title>
   <link rel="icon" href="/static/monitor-icon.png" type="image/png" sizes="64x64">
   <link rel="stylesheet" href="/static/style.css?v=27">
-  <script src="/static/app.js?v=31" defer></script>
+  <script src="/static/app.js?v=32" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -64,6 +64,7 @@
         <div><h1 id="shop-name">店铺商品</h1><p id="shop-catalog-status" role="status"></p><p id="shop-observation-times" class="meta"></p></div>
         <div class="detail-actions">
           <a id="shop-source" target="_blank" rel="noopener noreferrer">闲鱼主页</a>
+          <button id="collect-shop" type="button" disabled>采集商品</button>
           <button id="manage-shop" type="button">监控设置</button>
         </div>
       </header>
@@ -72,6 +73,7 @@
           <h2>在售商品</h2>
           <a id="shop-catalog-download" hidden>导出商品链接 CSV</a>
         </div>
+        <p id="shop-collection-message" class="meta" role="status" hidden></p>
         <p id="shop-catalog-change" class="shop-comparison" hidden></p>
         <div class="table-scroll">
           <table>

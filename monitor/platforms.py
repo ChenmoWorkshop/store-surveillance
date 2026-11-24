@@ -37,9 +37,9 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def open_once(url, headers=None):
+def open_once(url, headers=None, *, data=None):
     opener = build_opener(NoRedirect())
-    return opener.open(Request(url, headers=headers or {}), timeout=6)
+    return opener.open(Request(url, data=data, headers=headers or {}), timeout=6)
 
 
 def checked_url(url):
@@ -182,7 +182,8 @@ def observe_public_shop(target):
                 body = response.read(1000001)
             if len(body) > 1000000:
                 raise ValueError("公开店铺页超出读取上限")
-            return xhs_public.parse_catalog(body.decode("utf-8"), seller_id)
+            reading = xhs_public.parse_catalog(body.decode("utf-8"), seller_id)
+            return xhs_public.collect_catalog(reading, xhs_public.fetch_shop_page)
         except HTTPError as error:
             with error:
                 if error.code in (401, 403, 429):

@@ -548,6 +548,7 @@ def shop_products(
             products = catalog_products(db, latest | {"items": items}, target["platform"])
             summary = {key: latest[key] for key in ("active_count", "observed_at", "source")}
             summary["has_more"] = bool(latest["has_more"])
+            summary["complete"] = catalog_complete(latest)
         observation = observation_times(db, target_id)
     return {
         "target": dict(target),
@@ -560,6 +561,10 @@ def shop_products(
     }
 
 
+def catalog_complete(catalog):
+    return not catalog["has_more"] and len(catalog["items"]) == catalog["active_count"]
+
+
 def catalog_comparison(catalogs):
     if len(catalogs) < 2:
         return None
@@ -567,8 +572,7 @@ def catalog_comparison(catalogs):
     if latest["source"] != previous["source"]:
         return None
     result = {"active_change": latest["active_count"] - previous["active_count"]}
-    if all(not catalog["has_more"] and len(catalog["items"]) == catalog["active_count"]
-           for catalog in (latest, previous)):
+    if all(catalog_complete(catalog) for catalog in (latest, previous)):
         latest_ids = {item["id"] for item in latest["items"]}
         previous_ids = {item["id"] for item in previous["items"]}
         result.update(added=len(latest_ids - previous_ids), removed=len(previous_ids - latest_ids))
