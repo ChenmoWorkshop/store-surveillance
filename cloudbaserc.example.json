@@ -1,0 +1,7 @@
+{
+  "$schema": "https://static.cloudbase.net/cli/cloudbaserc.schema.json",
+  "envId": "<YOUR_CLOUDBASE_ENV_ID>",
+  "cloudrun": {
+    "name": "store-surveillance"
+  }
+}

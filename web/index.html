@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>链接监控台</title>
+  <link rel="icon" href="/static/monitor-icon.png" type="image/png" sizes="64x64">
+  <link rel="stylesheet" href="/static/style.css?v=27">
+  <script src="/static/app.js?v=31" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand" href="#"><span class="mark" aria-hidden="true">◈</span> 链接监控台</a>
+    <nav aria-label="工作区">
+      <button data-view="pool" class="selected">监控池</button>
+      <button data-view="events">异动记录</button>
+      <button data-view="rules">提醒规则</button>
+      <button data-view="runs">运行状态</button>
+    </nav>
+    <div class="health"><span id="health-dot" class="dot"></span><span id="health">正在连接</span></div>
+  </aside>
+  <main>
+    <section id="pool">
+      <header class="page-title">
+        <div><h1>监控池</h1><p>集中查看闲鱼和小红书商品、店铺的变化。</p></div>
+        <button class="primary" id="open-import">＋ 添加链接</button>
+      </header>
+      <div class="sources" id="sources"></div>
+      <section class="panel">
+        <div class="filters">
+          <div class="tabs" role="group" aria-label="平台">
+            <button data-platform="" class="selected">全部平台</button>
+            <button data-platform="xianyu">闲鱼</button>
+            <button data-platform="xiaohongshu">小红书</button>
+          </div>
+          <input id="search" type="search" placeholder="搜索名称或商品 ID" aria-label="搜索名称或商品 ID">
+          <select id="kind" aria-label="目标类型"><option value="">全部类型</option><option value="product">商品</option><option value="shop">店铺</option></select>
+          <select id="sort" aria-label="排序">
+            <option value="">最近添加</option>
+            <option value="price">价格从高到低</option><option value="price_asc">价格从低到高</option>
+            <option value="metric">销量／想要数从高到低</option><option value="metric_asc">销量／想要数从低到高</option>
+            <option value="hourly">小时增量从高到低</option><option value="hourly_asc">小时增量从低到高</option>
+            <option value="daily">今日增量从高到低</option><option value="daily_asc">今日增量从低到高</option>
+          </select>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th>监控目标</th>
+              <th scope="col"><button type="button" class="sort-header" data-sort="price">价格 <span class="sort-indicator" aria-hidden="true">↕</span></button></th>
+              <th scope="col"><button type="button" class="sort-header" data-sort="metric"><span id="pool-metric">展示销量 / 想要数</span> <span class="sort-indicator" aria-hidden="true">↕</span></button></th>
+              <th scope="col"><button type="button" class="sort-header" data-sort="hourly">小时增量 <span class="sort-indicator" aria-hidden="true">↕</span></button></th>
+              <th scope="col"><button type="button" class="sort-header" data-sort="daily">今日增量 <span class="sort-indicator" aria-hidden="true">↕</span></button></th>
+              <th>状态</th><th>首次观测</th><th>最后观测</th><th scope="col">操作</th></tr></thead>
+            <tbody id="targets"></tbody>
+          </table>
+        </div>
+        <div id="empty" class="empty" hidden><strong>暂无匹配链接</strong><p>添加商品或店铺链接，即可开始建立监控历史。</p></div>
+        <footer class="pagination"><span id="count"></span><button id="prev">上一页</button><button id="next">下一页</button></footer>
+      </section>
+    </section>
+    <section id="shop-page" hidden>
+      <button id="back-to-shops" type="button">返回店铺列表</button>
+      <header class="page-title shop-heading">
+        <div><h1 id="shop-name">店铺商品</h1><p id="shop-catalog-status" role="status"></p><p id="shop-observation-times" class="meta"></p></div>
+        <div class="detail-actions">
+          <a id="shop-source" target="_blank" rel="noopener noreferrer">闲鱼主页</a>
+          <button id="manage-shop" type="button">监控设置</button>
+        </div>
+      </header>
+      <section class="panel">
+        <div class="filters shop-toolbar">
+          <h2>在售商品</h2>
+          <a id="shop-catalog-download" hidden>导出商品链接 CSV</a>
+        </div>
+        <p id="shop-catalog-change" class="shop-comparison" hidden></p>
+        <div class="table-scroll">
+          <table>
+            <thead><tr><th scope="col">序号</th><th scope="col">商品</th><th scope="col">价格</th><th scope="col" id="shop-product-metric">想要数</th><th scope="col">商品记录</th></tr></thead>
+            <tbody id="shop-catalog-items"></tbody>
+          </table>
+        </div>
+        <footer class="pagination shop-pagination" aria-label="商品分页">
+          <span id="shop-page-range" role="status"></span>
+          <label>每页
+            <select id="shop-page-size" aria-label="每页商品数量">
+              <option value="20">20 条</option><option value="50">50 条</option><option value="100">100 条</option>
+            </select>
+          </label>
+          <button id="shop-prev" type="button" disabled>上一页</button>
+          <form id="shop-page-form" class="shop-page-form">
+            <label for="shop-page-number">第</label>
+            <input id="shop-page-number" type="number" min="1" max="1" step="1" value="1" aria-label="跳到第几页" required>
+            <span id="shop-page-total">/ 1 页</span>
+            <button type="submit">跳转</button>
+          </form>
+          <button id="shop-next" type="button" disabled>下一页</button>
+        </footer>
+      </section>
+    </section>
+    <section id="events" hidden>
+      <header class="page-title"><div><h1>异动记录</h1><p>查看销量、价格和商品状态变化。</p></div></header>
+      <div class="panel"><div id="event-list" class="records"></div></div>
+    </section>
+    <section id="rules" hidden>
+      <header class="page-title"><div><h1>提醒规则</h1><p>调整定时采样的异动条件。</p></div></header>
+      <form id="rule-form" class="panel settings">
+        <h2>小红书</h2>
+        <label>普通商品小时增量 <input name="hourly_units" type="number" min="1" max="1000000" required></label>
+        <label>高客单价门槛（元） <input name="premium_price" type="number" min="0" max="1000000" step="0.01" required></label>
+        <label>高价商品小时增量 <input name="premium_units" type="number" min="1" max="1000000" required></label>
+        <h2>闲鱼</h2>
+        <label>最低降价额（元，0 为关闭） <input name="price_drop" type="number" min="0" max="1000000" step="0.01" required></label>
+        <label>启用商品状态提醒 <input name="state_alerts" type="checkbox"></label>
+        <div><button type="submit" class="primary">保存规则</button> <span id="rule-message" role="status"></span></div>
+      </form>
+    </section>
+    <section id="runs" hidden>
+      <header class="page-title"><div><h1>运行状态</h1><p>查看近期采样任务和机器人送达情况。</p></div><button id="reload-runs">刷新记录</button></header>
+      <div class="panel settings"><h2>采样任务</h2><div id="job-list" class="records"></div><h2>通知投递</h2><div id="deliveries" class="records"></div>
+        <h2>数据备份</h2>
+        <p class="meta">导出包含监控目标、采样记录、异动和规则的全量 JSON。恢复请用命令行工具，避免误覆盖线上数据。</p>
+        <p><a id="backup-download" href="/api/v1/admin/export">下载全量备份</a></p>
+      </div>
+    </section>
+    <p id="app-message" class="app-message" role="alert" hidden></p>
+    <p id="app-status" class="app-status" role="status" hidden></p>
+  </main>
+  <dialog id="import-dialog">
+    <form id="import-form">
+      <header class="dialog-title"><div><h2>添加链接</h2><p>可粘贴多条商品、店铺链接或完整分享文案。</p></div><button type="button" class="close" aria-label="关闭">×</button></header>
+      <textarea name="links" aria-label="分享链接" placeholder="粘贴闲鱼或小红书链接" rows="6" required maxlength="60000"></textarea>
+      <div id="import-result" class="records" role="status"></div>
+      <footer class="dialog-actions"><button type="button" class="cancel">关闭</button><button class="primary" type="submit">识别并添加</button></footer>
+    </form>
+  </dialog>
+  <dialog id="detail-dialog" class="detail" aria-labelledby="detail-title">
+    <header class="dialog-title product-header">
+      <div class="product-identity">
+        <img id="detail-cover" alt="商品封面" referrerpolicy="no-referrer" hidden>
+        <div><div id="detail-platform" class="eyebrow"></div><h2 id="detail-title">目标详情</h2>
+          <div class="product-meta">
+            <span id="detail-platform-id"></span>
+            <span id="detail-shop-name"></span>
+            <span id="detail-last-fetched"></span>
+          </div>
+        </div>
+      </div>
+      <button type="button" class="close" aria-label="关闭">×</button>
+    </header>
+    <div class="detail-actions">
+      <a id="source-link" target="_blank" rel="noopener noreferrer">原链接</a>
+      <a id="download">导出 CSV</a>
+      <button id="refresh-target">立即采样</button>
+      <button id="toggle-target"></button>
+      <button id="delete-target" class="danger" type="button">删除</button>
+    </div>
+    <form id="category-form" class="product-category">
+      <label for="detail-category">分类</label>
+      <select id="detail-category" name="category"></select>
+      <input id="custom-category" name="custom" placeholder="输入分类名称" aria-label="自定义分类名称" maxlength="40" hidden>
+      <button type="submit">保存分类</button>
+    </form>
+    <dl class="detail-indicators">
+      <div><dt id="detail-count-label">展示销量</dt><dd id="detail-current-count">—</dd></div>
+      <div><dt id="detail-price-label">观测价格</dt><dd id="detail-current-price">—</dd></div>
+      <div><dt>今日增量</dt><dd id="detail-today-change">—</dd></div>
+      <div><dt>上小时增量</dt><dd id="detail-hour-change">—</dd></div>
+      <div><dt>近 3 小时增量</dt><dd id="detail-three-hour-change">—</dd></div>
+    </dl>
+    <dl class="observation-times">
+      <div><dt>首次观测</dt><dd id="first-observed-at">—</dd></div>
+      <div><dt>最后观测</dt><dd id="last-observed-at">—</dd></div>
+    </dl>
+    <div class="detail-tabs" role="group" aria-label="观测数据">
+      <button type="button" data-detail-view="daily" aria-pressed="true">每日走势</button>
+      <button type="button" data-detail-view="hourly" aria-pressed="false">小时数据</button>
+      <button type="button" data-detail-view="raw" aria-pressed="false">原始记录</button>
+    </div>
+    <section id="detail-daily">
+      <div class="daily-trend">
+        <h3 id="daily-title">每日走势</h3>
+        <p id="daily-chart-empty" class="meta" hidden>暂无可绘制的精确读数</p>
+        <canvas id="daily-chart" width="900" height="235" role="img" aria-label="每日累计指标折线，具体读数见下方表格"></canvas>
+      </div>
+      <div class="daily-table">
+        <div class="table-scroll"><table>
+          <thead><tr><th scope="col">日期</th><th scope="col">当日最后观测</th><th scope="col" id="daily-metric-label">展示销量</th><th scope="col">较前一日</th></tr></thead>
+          <tbody id="daily-history"></tbody>
+        </table></div>
+        <footer class="pagination" aria-label="每日数据分页">
+          <span id="daily-range" role="status"></span>
+          <button id="daily-prev" type="button">上一页</button>
+          <button id="daily-next" type="button">下一页</button>
+        </footer>
+      </div>
+    </section>
+    <section id="detail-hourly" class="hourly-observations" hidden>
+      <h3>每小时观测</h3>
+      <p class="meta">北京时间整点采样 · 今日增量从当天首次有效整点读数起算</p>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>计划时间</th><th>实际观测</th><th>读数</th><th>小时增量</th><th>今日增量</th><th>日基准</th><th>状态</th></tr></thead>
+          <tbody id="hourly-history"></tbody>
+        </table>
+      </div>
+    </section>
+    <section id="detail-raw" hidden>
+    <label id="chart-metric-label" hidden>趋势指标
+      <select id="chart-metric"><option value="want_count">想要数</option><option value="price_fen">价格</option></select>
+    </label>
+    <div class="chart-wrap" id="chart-wrap" hidden><h3 id="chart-title">最近读数</h3><canvas id="chart" width="660" height="170" role="img" aria-label="历史指标折线，精确值见下方表格"></canvas></div>
+    <div class="table-scroll" id="detail-history"><table><thead><tr><th>时间 / 录入方式</th><th id="detail-metric">展示销量</th><th>价格</th><th>商品状态</th><th>小时增量</th><th>今日增量</th></tr></thead><tbody id="history"></tbody></table></div>
+    </section>
+    <form id="rename-form" class="rename"><input name="title" aria-label="目标名称" required maxlength="160"><button type="submit">修改名称</button></form>
+    <details id="reading-details">
+      <summary>手工记录观测值</summary>
+      <form id="visible-reading-form" hidden>
+        <label for="visible-reading-text">粘贴商品页显示的价格和想要数</label>
+        <textarea id="visible-reading-text" name="text" rows="2" maxlength="10000" placeholder="例如：活动价 ¥2.00，78 人想要" required></textarea>
+        <button type="submit">识别并保存</button>
+      </form>
+      <form id="reading-form" class="reading">
+        <label id="sales-field">展示销量<input name="raw_sales" maxlength="100" placeholder="例如 5000+"></label>
+        <label id="want-field" hidden>想要数<input name="want_count" type="number" min="0" max="1000000000000" step="1" inputmode="numeric"></label>
+        <label>价格（元）<input name="price" type="number" min="0" max="100000000" step="0.01"></label>
+        <label>商品状态<select name="listing_state"><option value="">未观察</option><option value="active">在售</option><option value="sold">已售</option><option value="delisted">下架</option></select></label>
+        <button class="primary" type="submit">保存读数</button>
+      </form>
+    </details>
+    <p id="detail-message" role="status"></p>
+  </dialog>
+</body>
+</html>

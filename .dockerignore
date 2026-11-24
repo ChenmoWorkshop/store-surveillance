@@ -1,0 +1,8 @@
+**
+!Dockerfile
+!requirements.txt
+!monitor/
+!monitor/**
+!web/
+!web/**
+**/__pycache__/
