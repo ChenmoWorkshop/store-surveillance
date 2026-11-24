@@ -111,10 +111,13 @@ def listing_items(page):
             continue
         if not isinstance(title, str) or not title.strip():
             continue
+        details = data.get("detailParams") or {}
         price = _fen((data.get("priceInfo") or {}).get("price"))
         if price is None:
-            price = _fen((data.get("detailParams") or {}).get("soldPrice"))
-        items[item_id] = {"id": item_id, "title": title.strip()[:200], "price_fen": price}
+            price = _fen(details.get("soldPrice"))
+        items[item_id] = {"id": item_id, "title": title.strip()[:200], "price_fen": price,
+                          "listed_at": data.get("onShelfTime") or details.get("onShelfTime")
+                          or data.get("publishTime") or details.get("publishTime")}
     return items
 
 
@@ -132,6 +135,8 @@ def listing_query(uid, page, group=None, previous=None):
 
 def collect_catalog(uid, head, listing, fetch_page):
     name, number = parse_head(uid, head)
+    module = (head.get("data") or {}).get("module") or {}
+    profile = module.get("base") or {}
     deadline = time.monotonic() + 35
     page_data = listing["data"]
     groups = page_data.get("itemGroupList") or []
@@ -165,6 +170,8 @@ def collect_catalog(uid, head, listing, fetch_page):
     return {
         "external_id": uid,
         "shop_name": name or None,
+        "follower_count": profile.get("fansCount", profile.get("fansCnt")),
+        "shop_opened_at": profile.get("shopOpenedAt"),
         "shop_catalog": {
             "active_count": number,
             "items": list(items.values()),

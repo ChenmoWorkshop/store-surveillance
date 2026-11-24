@@ -39,9 +39,13 @@ def parse_catalog(html, seller_id):
                    if (card.get("baseSellerInfo") or {}).get("sellerId") == seller_id), {})
     tags = (seller.get("tagStrategyMap") or {}).get("productTag")
     total_sales = sold_label(tags)
+    seller_name = (seller.get("baseSellerInfo") or {}).get("sellerName")
     return {
         "external_id": seller_id,
         "raw_sales": total_sales,
+        "shop_name": seller_name.strip()[:256] if isinstance(seller_name, str) and seller_name.strip() else None,
+        "follower_count": (seller.get("userInfo") or {}).get("fansCnt"),
+        "shop_opened_at": (seller.get("baseSellerInfo") or {}).get("shopOpenedAt"),
         "shop_catalog": {"active_count": total, "items": list(visible.values()),
                          "has_more": goods.get("hasMore") is True or len(visible) != total},
     }
@@ -67,7 +71,11 @@ def goods_items(goods, seller_id):
         sales = sold_label(tags.get("afterPrice"))
         price_info = (goods_card.get("marketingInfo") or {}).get("priceInfo") or {}
         fen = price_in_fen((price_info.get("expectedPrice") or {}).get("priceStr"))
-        items[item_id] = {"id": item_id, "title": title.strip()[:200], "price_fen": fen, "raw_sales": sales}
+        items[item_id] = {"id": item_id, "title": title.strip()[:200], "price_fen": fen, "raw_sales": sales,
+                          "listed_at": info.get("itemOnShelfTime")}
+        sku_id = info.get("skuId")
+        if isinstance(sku_id, str) and PRODUCT_ID.fullmatch(sku_id):
+            items[item_id]["sku_id"] = sku_id
     return items
 
 

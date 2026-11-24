@@ -29,6 +29,8 @@ nav button.selected,.tabs button.selected{background:var(--soft);color:#155b43;b
 .dot.ready{background:#228357}
 main{width:100%;max-width:1520px;padding:42px clamp(20px,4vw,60px)}
 .page-title{display:flex;justify-content:space-between;align-items:center;gap:18px;margin-bottom:24px}
+.pool-add-actions{display:flex;flex-wrap:wrap;gap:8px}
+.pool-add-actions button{white-space:nowrap}
 .primary{background:var(--green);color:white;border-color:var(--green);white-space:nowrap}
 .primary:hover{background:#104c3a;color:white}
 .sources{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 18px}
@@ -71,7 +73,8 @@ dialog textarea{width:100%;resize:vertical}
 .dialog-actions,.detail-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .dialog-actions{justify-content:flex-end;margin-top:16px}
 .detail{width:min(1100px,calc(100vw - 28px))}
-.product-header{align-items:flex-start}
+.detail-close{position:sticky;top:0;z-index:2;display:grid;place-items:center;width:44px;height:44px;margin-inline-start:auto;margin-block-end:-44px;padding:0;border:1px solid var(--line);background:var(--white)}
+.product-header{align-items:flex-start;padding-inline-end:56px}
 .product-identity{display:flex;gap:16px;align-items:center;min-width:0}
 .product-identity h2{font-size:clamp(1.15rem,2.2vw,1.65rem);line-height:1.35;white-space:normal;overflow-wrap:anywhere}
 .product-meta{margin-top:9px;display:flex;gap:5px 16px;flex-wrap:wrap;color:var(--muted);font-size:.88rem;line-height:1.45}
@@ -113,6 +116,7 @@ canvas{width:100%;display:block}
 .hourly-observations thead th{position:sticky;top:0}
 .shop-heading .detail-actions{margin:0}
 .shop-toolbar{justify-content:space-between}
+.shop-monitor-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .shop-comparison{margin:0 16px 12px}
 .shop-pagination{flex-wrap:wrap}
 .shop-page-form{display:flex;align-items:center;gap:6px}
@@ -121,6 +125,7 @@ canvas{width:100%;display:block}
 .shop-row-number{color:var(--muted);font-variant-numeric:tabular-nums}
 .shop-product-link{display:block;white-space:normal;min-width:220px;max-width:620px;line-height:1.45}
 .target-button[href]{display:inline-block;vertical-align:middle}
+.target-button.shop-target-button{white-space:normal;overflow-wrap:anywhere}
 
 
 .eyebrow{font-size:.84rem;color:var(--green);margin-bottom:5px}
@@ -134,3 +139,4 @@ summary{cursor:pointer;font-weight:650}
 .app-message{padding:10px 12px;border:1px solid #e5c299;border-radius:8px;background:#fff3e4;color:#773619}
 @media(max-width:850px){body{display:block}.sidebar{position:static;height:auto;display:flex;justify-content:space-between;padding:13px 18px;gap:9px}.sidebar nav{display:flex;flex-wrap:wrap;margin:0}.health{display:none}main{padding-top:24px}.filters input{margin-left:0}.target-button{max-width:210px}}
 @media(max-width:480px){h1{font-size:1.66rem}.page-title{align-items:flex-start}.page-title p{font-size:.88rem}.filters{padding:10px}.filters input{flex-basis:100%}.filters select{width:calc(50% - 5px)}}
+@media(max-width:480px){#pool>.page-title{flex-direction:column}}

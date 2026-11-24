@@ -5,8 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>链接监控台</title>
   <link rel="icon" href="/static/monitor-icon.png" type="image/png" sizes="64x64">
-  <link rel="stylesheet" href="/static/style.css?v=27">
-  <script src="/static/app.js?v=32" defer></script>
+  <link rel="stylesheet" href="/static/style.css?v=31">
+  <script src="/static/app.js?v=43" defer></script>
 </head>
 <body>
   <aside class="sidebar">
@@ -23,7 +23,10 @@
     <section id="pool">
       <header class="page-title">
         <div><h1>监控池</h1><p>集中查看闲鱼和小红书商品、店铺的变化。</p></div>
-        <button class="primary" id="open-import">＋ 添加链接</button>
+        <div class="pool-add-actions">
+          <button class="primary" type="button" data-import-kind="product">＋ 添加商品链接</button>
+          <button type="button" data-import-kind="shop">＋ 添加店铺链接</button>
+        </div>
       </header>
       <div class="sources" id="sources"></div>
       <section class="panel">
@@ -33,7 +36,7 @@
             <button data-platform="xianyu">闲鱼</button>
             <button data-platform="xiaohongshu">小红书</button>
           </div>
-          <input id="search" type="search" placeholder="搜索名称或商品 ID" aria-label="搜索名称或商品 ID">
+          <input id="search" type="search" placeholder="搜索商品、店铺关键词或 ID" aria-label="搜索商品、店铺关键词或 ID" maxlength="160">
           <select id="kind" aria-label="目标类型"><option value="">全部类型</option><option value="product">商品</option><option value="shop">店铺</option></select>
           <select id="sort" aria-label="排序">
             <option value="">最近添加</option>
@@ -59,9 +62,9 @@
       </section>
     </section>
     <section id="shop-page" hidden>
-      <button id="back-to-shops" type="button">返回店铺列表</button>
+      <button id="shop-back" type="button">返回上一页</button>
       <header class="page-title shop-heading">
-        <div><h1 id="shop-name">店铺商品</h1><p id="shop-catalog-status" role="status"></p><p id="shop-observation-times" class="meta"></p></div>
+        <div><h1 id="shop-name">店铺商品</h1><p id="shop-catalog-status" role="status"></p><p id="shop-profile" class="meta"></p><p id="shop-observation-times" class="meta"></p></div>
         <div class="detail-actions">
           <a id="shop-source" target="_blank" rel="noopener noreferrer">闲鱼主页</a>
           <button id="collect-shop" type="button" disabled>采集商品</button>
@@ -71,13 +74,18 @@
       <section class="panel">
         <div class="filters shop-toolbar">
           <h2>在售商品</h2>
-          <a id="shop-catalog-download" hidden>导出商品链接 CSV</a>
+          <div class="shop-monitor-actions">
+            <button id="monitor-shop-all" class="primary" type="button" disabled>全部加入监控</button>
+            <button id="pause-shop-all" type="button" disabled>全部暂停监控</button>
+            <a id="shop-catalog-download" hidden>导出商品链接 CSV</a>
+          </div>
         </div>
+        <p id="shop-monitor-message" class="meta shop-comparison" role="status" hidden></p>
         <p id="shop-collection-message" class="meta" role="status" hidden></p>
         <p id="shop-catalog-change" class="shop-comparison" hidden></p>
         <div class="table-scroll">
           <table>
-            <thead><tr><th scope="col">序号</th><th scope="col">商品</th><th scope="col">价格</th><th scope="col" id="shop-product-metric">想要数</th><th scope="col">商品记录</th></tr></thead>
+            <thead><tr><th scope="col">序号</th><th scope="col">商品</th><th scope="col">价格</th><th scope="col" id="shop-product-metric">想要数</th><th scope="col">小时增量</th><th scope="col">今日增量</th><th scope="col">商品记录</th></tr></thead>
             <tbody id="shop-catalog-items"></tbody>
           </table>
         </div>
@@ -127,15 +135,16 @@
     <p id="app-message" class="app-message" role="alert" hidden></p>
     <p id="app-status" class="app-status" role="status" hidden></p>
   </main>
-  <dialog id="import-dialog">
+  <dialog id="import-dialog" aria-labelledby="import-title" aria-describedby="import-hint">
     <form id="import-form">
-      <header class="dialog-title"><div><h2>添加链接</h2><p>可粘贴多条商品、店铺链接或完整分享文案。</p></div><button type="button" class="close" aria-label="关闭">×</button></header>
-      <textarea name="links" aria-label="分享链接" placeholder="粘贴闲鱼或小红书链接" rows="6" required maxlength="60000"></textarea>
+      <header class="dialog-title"><div><h2 id="import-title"></h2><p id="import-hint"></p></div><button type="button" class="close" aria-label="关闭">×</button></header>
+      <textarea name="links" rows="6" required maxlength="60000" autofocus></textarea>
       <div id="import-result" class="records" role="status"></div>
       <footer class="dialog-actions"><button type="button" class="cancel">关闭</button><button class="primary" type="submit">识别并添加</button></footer>
     </form>
   </dialog>
   <dialog id="detail-dialog" class="detail" aria-labelledby="detail-title">
+    <button type="button" class="close detail-close" aria-label="关闭">×</button>
     <header class="dialog-title product-header">
       <div class="product-identity">
         <img id="detail-cover" alt="商品封面" referrerpolicy="no-referrer" hidden>
@@ -143,11 +152,12 @@
           <div class="product-meta">
             <span id="detail-platform-id"></span>
             <span id="detail-shop-name"></span>
+            <span id="detail-listed-at"></span>
+            <span id="detail-listing-age"></span>
             <span id="detail-last-fetched"></span>
           </div>
         </div>
       </div>
-      <button type="button" class="close" aria-label="关闭">×</button>
     </header>
     <div class="detail-actions">
       <a id="source-link" target="_blank" rel="noopener noreferrer">原链接</a>
@@ -212,6 +222,7 @@
     </label>
     <div class="chart-wrap" id="chart-wrap" hidden><h3 id="chart-title">最近读数</h3><canvas id="chart" width="660" height="170" role="img" aria-label="历史指标折线，精确值见下方表格"></canvas></div>
     <div class="table-scroll" id="detail-history"><table><thead><tr><th>时间 / 录入方式</th><th id="detail-metric">展示销量</th><th>价格</th><th>商品状态</th><th>小时增量</th><th>今日增量</th></tr></thead><tbody id="history"></tbody></table></div>
+    <p id="listing-state-note" class="meta">旧记录曾成功读到商品数据时按「在售」显示。违规删除需要平台明确说明，无法判断时显示「待确认」。</p>
     </section>
     <form id="rename-form" class="rename"><input name="title" aria-label="目标名称" required maxlength="160"><button type="submit">修改名称</button></form>
     <details id="reading-details">
@@ -225,7 +236,7 @@
         <label id="sales-field">展示销量<input name="raw_sales" maxlength="100" placeholder="例如 5000+"></label>
         <label id="want-field" hidden>想要数<input name="want_count" type="number" min="0" max="1000000000000" step="1" inputmode="numeric"></label>
         <label>价格（元）<input name="price" type="number" min="0" max="100000000" step="0.01"></label>
-        <label>商品状态<select name="listing_state"><option value="">未观察</option><option value="active">在售</option><option value="sold">已售</option><option value="delisted">下架</option></select></label>
+        <label>商品状态<select name="listing_state"><option value="">待确认</option><option value="active">在售</option><option value="sold">已售／售罄</option><option value="delisted">已下架</option><option value="removed_violation">违规删除</option><option value="unavailable">链接不可用</option></select></label>
         <button class="primary" type="submit">保存读数</button>
       </form>
     </details>

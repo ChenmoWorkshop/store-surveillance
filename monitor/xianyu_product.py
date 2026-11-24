@@ -16,6 +16,8 @@ import urllib.parse
 import urllib.request
 from decimal import Decimal, InvalidOperation
 
+from .models import listing_state_from_text
+
 DETAIL_API = "mtop.taobao.idle.awesome.detail"
 APP_KEY = "12574478"
 # 电脑版网页用的 appKey，店铺接口在机房网络下可以正常调用，商品详情也先走它。
@@ -25,7 +27,6 @@ USER_AGENT = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 )
-STATE_LABELS = {"在线": "active", "已售出": "sold", "已下架": "delisted"}
 
 
 class TokenMissing(RuntimeError):
@@ -69,6 +70,11 @@ def _ret(payload):
     return ret[0] if isinstance(ret, list) and ret else str(ret or "")
 
 
+def _reported_unavailable(reply):
+    state = listing_state_from_text(reply.partition("::")[2] or reply)
+    return state if state != "active" else None
+
+
 def detail_url(token, body, app_key=APP_KEY):
     """按 mtop 规则拼出一次详情请求的地址（sign = md5(token&t&appKey&data)）。"""
     instant = str(int(time.time() * 1000))
@@ -86,6 +92,9 @@ def parse_detail(payload, item_id):
     # 网关异常的状态文案顺序不固定（RGV587 / FAIL_SYS_USER_VALIDATE / SESSION_EXPIRED 等），
     # 这里只认明确的成功，其余统一交给浏览器通道重试。
     if "SUCCESS" not in ret:
+        state = _reported_unavailable(ret)
+        if state:
+            return {"listing_state": state}
         raise RuntimeError(f"闲鱼详情接口要求登录或风控校验：{ret[:100] or '无返回状态'}")
     data = payload.get("data")
     if not isinstance(data, dict):
@@ -113,14 +122,15 @@ def parse_detail(payload, item_id):
     if isinstance(title, str) and title.strip():
         metrics["official_title"] = title.strip()[:2048]
 
-    state = item.get("itemStatusStr")
-    if isinstance(state, str) and state.strip() in STATE_LABELS:
-        metrics["listing_state"] = STATE_LABELS[state.strip()]
+    state = listing_state_from_text(item.get("itemStatusStr"))
+    if state:
+        metrics["listing_state"] = state
+    metrics["listed_at"] = item.get("onShelfTime") or item.get("publishTime")
 
     cover = _cover_url(item)
     if cover:
         metrics["cover_url"] = cover
-    if not metrics.get("price_fen") and "want_count" not in metrics:
+    if price is None and "want_count" not in metrics and not state:
         raise ValueError("闲鱼详情未显示价格或想要数")
     return metrics
 
@@ -192,8 +202,9 @@ def read_browser_product(target):
             payload = response.json()
         except Exception:
             return
-        if "SUCCESS" in _ret(payload):
-            if not found:
+        if isinstance(payload, dict):
+            reply = _ret(payload)
+            if not found and ("SUCCESS" in reply or _reported_unavailable(reply)):
                 found.append(payload)
 
     try:
@@ -259,7 +270,7 @@ def _context_call(context, item_id, app_key):
         except Exception:
             return "接口未返回 JSON"
         status = _ret(payload)
-        if "SUCCESS" in status:
+        if "SUCCESS" in status or _reported_unavailable(status):
             return payload
         last = status
         if "TOKEN_EMPTY" not in status:

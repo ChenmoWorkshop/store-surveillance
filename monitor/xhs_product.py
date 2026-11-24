@@ -7,6 +7,8 @@ import sys
 from decimal import Decimal
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
+from .models import listing_state_from_text
+
 PRODUCT_ID = re.compile(r"[a-f0-9]{24}")
 AMOUNT = re.compile(r"¥\s*([0-9]{1,9})(?:\s*\.\s*([0-9]{1,2}))?(?!\s*\.|[0-9])")
 SALES_LABEL = re.compile(r"已售\s*[0-9][0-9,.]*(?:万)?\+?(?:件|单)?")
@@ -45,6 +47,8 @@ def read_product(target):
             return read_browser_product(target)
         except (RuntimeError, ValueError) as fallback:
             raise RuntimeError(f"小红书详情接口未取得读数；浏览器备用采样：{fallback}") from error
+    if result.get("listing_state") in ("sold", "delisted", "removed_violation", "unavailable"):
+        return result
     if "raw_sales" not in result or "price_fen" not in result:
         try:
             fallback = read_browser_product(target)
@@ -69,7 +73,12 @@ def read_json_product(external_id):
 
 
 def parse_json_product(payload, external_id):
-    if not isinstance(payload, dict) or payload.get("success") is not True:
+    if not isinstance(payload, dict):
+        raise ValueError("小红书接口未返回商品详情")
+    if payload.get("success") is not True:
+        state = listing_state_from_text(payload.get("msg"))
+        if state and state != "active":
+            return {"listing_state": state}
         raise ValueError("小红书接口未返回商品详情")
     data = payload.get("data")
     blocks = data.get("template_data") if isinstance(data, dict) else None
@@ -99,7 +108,25 @@ def parse_json_product(payload, external_id):
         price.get("spuAnalysisDataText"), main.get("spuAnalysisDataText"),
         price.get("itemAnalysisDataText"), desc.get("itemAnalysisDataText"),
     ) if isinstance(value, str) and SALES_LABEL.fullmatch(value.strip())), "")
-    result = parse_product_metric(price_text, sales, price_label)
+    buttons = section("bottomBarMainH5").get("buttons")
+    state = None
+    if isinstance(buttons, list):
+        actions = [button for button in buttons if isinstance(button, dict)]
+        state = next((status for button in actions if (status := listing_state_from_text(button.get("text")))
+                      and status != "active"), None)
+        if state is None and any(button.get("type") == "instantBuy" and button.get("actionType") == "instantBuy"
+                                 and button.get("text") == "立即购买" and not button.get("disabled") for button in actions):
+            state = "active"
+    try:
+        result = parse_product_metric(price_text, sales, price_label)
+    except ValueError:
+        if not state:
+            raise
+        result = {}
+    if state:
+        result["listing_state"] = state
+    result["listed_at"] = (desc.get("itemOnShelfTime") or main.get("itemOnShelfTime")
+                           or desc.get("onShelfTime") or main.get("onShelfTime"))
     for key, value, limit in (("official_title", desc.get("name") or main.get("name"), 2048),
                               ("shop_name", section("sellerH5").get("name"), 256)):
         if isinstance(value, str) and value.strip():

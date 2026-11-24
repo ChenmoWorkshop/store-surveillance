@@ -8,6 +8,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .models import LISTING_LABELS
+
 CST = timezone(timedelta(hours=8))
 ROOT = Path(__file__).resolve().parents[1]
 DB_FILE = Path(os.getenv("MONITOR_DB", ROOT / "data" / "monitor.db"))
@@ -26,6 +28,10 @@ def now():
 
 def stamp(time):
     return time.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def current_day_start():
+    return stamp(now().astimezone(CST).replace(hour=0, minute=0, second=0, microsecond=0))
 
 
 @contextmanager
@@ -52,8 +58,9 @@ def init():
                 id INTEGER PRIMARY KEY, platform TEXT NOT NULL, kind TEXT NOT NULL,
                 external_id TEXT NOT NULL, url TEXT NOT NULL, title TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1, active_since TEXT NOT NULL,
+                shop_only INTEGER NOT NULL DEFAULT 0,
                 deleted_at TEXT, cover_url TEXT, official_title TEXT, shop_name TEXT, category TEXT,
-                reviewed_sampling_slot TEXT,
+                reviewed_sampling_slot TEXT, follower_count INTEGER, shop_opened_at TEXT, listed_at TEXT,
                 UNIQUE(platform, kind, external_id)
             );
             CREATE TABLE IF NOT EXISTS import_readings (
@@ -99,9 +106,14 @@ def init():
         """)
         db.execute("BEGIN IMMEDIATE")
         target_columns = {column["name"] for column in db.execute("PRAGMA table_info(targets)")}
+        if "shop_only" not in target_columns:
+            db.execute("ALTER TABLE targets ADD COLUMN shop_only INTEGER NOT NULL DEFAULT 0")
         for column in ("deleted_at", "cover_url", "official_title", "shop_name", "category", "reviewed_sampling_slot"):
             if column not in target_columns:
                 db.execute(f"ALTER TABLE targets ADD COLUMN {column} TEXT")
+        for column, data_type in (("follower_count", "INTEGER"), ("shop_opened_at", "TEXT"), ("listed_at", "TEXT")):
+            if column not in target_columns:
+                db.execute(f"ALTER TABLE targets ADD COLUMN {column} {data_type}")
         snapshot_columns = {column["name"] for column in db.execute("PRAGMA table_info(snapshots)")}
         if "want_count" not in snapshot_columns:
             db.execute("ALTER TABLE snapshots ADD COLUMN want_count INTEGER")
@@ -112,6 +124,22 @@ def init():
         if "has_more" not in catalog_columns:
             db.execute("ALTER TABLE shop_catalogs ADD COLUMN has_more INTEGER")
         db.execute("INSERT OR IGNORE INTO rules VALUES (1, ?)", (json.dumps(RULE_DEFAULTS),))
+        schema_version = db.execute("PRAGMA user_version").fetchone()[0]
+        if schema_version < 1:
+            recompute_deltas(db)
+        if schema_version < 2:
+            backfill_readable_product_states(db)
+            db.execute("PRAGMA user_version=2")
+
+
+def backfill_readable_product_states(db):
+    """Treat successful legacy product observations as in stock when status was omitted."""
+    return db.execute(
+        """UPDATE snapshots SET listing_state='active'
+           WHERE listing_state IS NULL AND source IN ('scheduled','refresh')
+             AND (raw_sales IS NOT NULL OR exact_sales IS NOT NULL OR want_count IS NOT NULL OR price_fen IS NOT NULL)
+             AND target_id IN (SELECT id FROM targets WHERE kind='product')""",
+    ).rowcount
 
 
 def dump_database():
@@ -258,18 +286,46 @@ def compute_deltas(db, target, slot, instant, current, quality, column):
     return hourly, current - first["metric"], first["observed_at"], strict
 
 
+def product_sample_deltas(db, target, instant, current, before_id=None):
+    """Compare automatic product observations and carry the current day's baseline forward."""
+    if current is None:
+        return None, None, None, False
+    column = metric_column(target)
+    observed = stamp(instant)
+    previous = db.execute(
+        f"""SELECT {column} AS metric,observed_at,daily_delta,daily_baseline_at
+            FROM snapshots WHERE target_id=? AND source IN ('scheduled','refresh')
+              AND {column} IS NOT NULL AND observed_at<=?
+              AND (observed_at<? OR ? IS NULL OR id<?)
+              AND (? < ? OR observed_at>=?)
+            ORDER BY observed_at DESC,id DESC LIMIT 1""",
+        (target["id"], observed, observed, before_id, before_id,
+         observed, target["active_since"], target["active_since"]),
+    ).fetchone()
+    change = current - previous["metric"] if previous else 0
+    reset = column == "exact_sales" and change < 0
+    hourly = 0 if reset else change
+    day_start = stamp(instant.astimezone(CST).replace(hour=0, minute=0, second=0, microsecond=0))
+    if (not reset and previous and previous["daily_delta"] is not None
+            and (previous["daily_baseline_at"] or "") >= day_start):
+        return hourly, previous["daily_delta"] + change, previous["daily_baseline_at"], reset
+    return hourly, 0, observed, reset
+
+
 def recompute_deltas(db):
-    """Recalculate hourly/daily deltas for every scheduled snapshot.
+    """Recalculate deltas for automatic observations in observation order.
 
     Restoring a backup written by an older build can carry stale or empty
     deltas; replaying them with the current rules keeps the history readable.
     """
     snapshots = db.execute(
-        """SELECT s.id,s.target_id,s.slot,s.observed_at,s.quality,s.raw_sales,s.exact_sales,
+        """SELECT s.id,s.target_id,s.slot,s.observed_at,s.source,s.quality,s.exact_sales,
                   s.want_count,c.active_count
            FROM snapshots s LEFT JOIN shop_catalogs c ON c.snapshot_id=s.id
-           WHERE s.source='scheduled' AND s.slot IS NOT NULL
-           ORDER BY s.slot,s.id"""
+           JOIN targets t ON t.id=s.target_id
+           WHERE (s.source='scheduled' AND s.slot IS NOT NULL)
+              OR (s.source='refresh' AND t.kind='product')
+           ORDER BY s.observed_at,s.id"""
     ).fetchall()
     targets = {row["id"]: row for row in db.execute("SELECT * FROM targets")}
     for row in snapshots:
@@ -277,12 +333,20 @@ def recompute_deltas(db):
         if target is None:
             continue
         column = metric_column(target)
-        hourly, daily, baseline, _ = compute_deltas(
-            db, target, datetime.fromisoformat(row["slot"]), datetime.fromisoformat(row["observed_at"]),
-            row[column], row["quality"], column,
-        )
-        db.execute("UPDATE snapshots SET hourly_delta=?,daily_delta=?,daily_baseline_at=? WHERE id=?",
-                   (hourly, daily, baseline, row["id"]))
+        instant = datetime.fromisoformat(row["observed_at"])
+        quality = row["quality"]
+        if row["source"] == "scheduled":
+            hourly, daily, baseline, _ = compute_deltas(
+                db, target, datetime.fromisoformat(row["slot"]), instant, row[column], quality, column,
+            )
+        if target["kind"] == "product":
+            change, daily, baseline, reset = product_sample_deltas(db, target, instant, row[column], row["id"])
+            if row["source"] == "refresh":
+                hourly = change
+                if row["exact_sales"] is not None:
+                    quality = "counter_reset" if reset else "exact"
+        db.execute("UPDATE snapshots SET hourly_delta=?,daily_delta=?,daily_baseline_at=?,quality=? WHERE id=?",
+                   (hourly, daily, baseline, quality, row["id"]))
     return len(snapshots)
 
 
@@ -302,11 +366,12 @@ def update_product_cover(db, target_id, url):
 
 def update_product_metadata(db, target_id, reading):
     update_product_cover(db, target_id, reading.cover_url)
-    if reading.official_title or reading.shop_name:
+    if reading.official_title or reading.shop_name or reading.listed_at:
         db.execute(
             """UPDATE targets SET official_title=COALESCE(?,official_title),
-                   shop_name=COALESCE(?,shop_name) WHERE id=? AND deleted_at IS NULL""",
-            (reading.official_title or None, reading.shop_name or None, target_id),
+                   shop_name=COALESCE(?,shop_name),listed_at=COALESCE(?,listed_at)
+                   WHERE id=? AND deleted_at IS NULL""",
+            (reading.official_title or None, reading.shop_name or None, reading.listed_at, target_id),
         )
 
 
@@ -314,6 +379,16 @@ def record(db, target, reading, instant, source, slot=None):
     target_id = target["id"]
     if target["kind"] == "product":
         update_product_metadata(db, target_id, reading)
+    else:
+        name = reading.shop_name if target["platform"] == "xiaohongshu" else None
+        if name or reading.follower_count is not None or reading.shop_opened_at:
+            db.execute(
+                """UPDATE targets SET shop_name=COALESCE(?,shop_name),
+                       title=CASE WHEN title='店铺 ' || external_id THEN COALESCE(?,title) ELSE title END,
+                       follower_count=COALESCE(?,follower_count),shop_opened_at=COALESCE(?,shop_opened_at)
+                   WHERE id=? AND deleted_at IS NULL""",
+                (name, name, reading.follower_count, reading.shop_opened_at, target_id),
+            )
     last = db.execute(
         """SELECT * FROM snapshots WHERE target_id=? AND source=?
            AND (slot IS NULL OR slot < ?) ORDER BY observed_at DESC, id DESC LIMIT 1""",
@@ -334,6 +409,13 @@ def record(db, target, reading, instant, source, slot=None):
     if source == "scheduled":
         hourly, daily, day_baseline, strict_hourly = scheduled_deltas(
             db, target, slot, instant, reading, quality)
+    if target["kind"] == "product" and source in ("scheduled", "refresh"):
+        change, daily, day_baseline, reset = product_sample_deltas(db, target, instant,
+                                                                 getattr(reading, metric_column(target)))
+        if source == "refresh":
+            hourly = change
+            if sales is not None:
+                quality = "counter_reset" if reset else "exact"
     snapshot_id = db.execute(
         """INSERT INTO snapshots(target_id, slot, observed_at, source, raw_sales, exact_sales,
                price_fen, listing_state, hourly_delta, daily_delta, quality, want_count,
@@ -371,7 +453,7 @@ def record(db, target, reading, instant, source, slot=None):
     if last and reading.listing_state is not None:
         previous_state = latest_field(db, target_id, source, "listing_state", snapshot_id)
         if previous_state and previous_state != reading.listing_state:
-            changes.append(f"{STATE_LABELS[previous_state]} → {STATE_LABELS[reading.listing_state]}")
+            changes.append(f"{LISTING_LABELS.get(previous_state, '待确认')} → {LISTING_LABELS[reading.listing_state]}")
             if rules["state_alerts"] and target["platform"] == "xianyu" and target["kind"] == "product":
                 matches.append("商品状态")
     if changes:
@@ -381,9 +463,6 @@ def record(db, target, reading, instant, source, slot=None):
              json.dumps(matches, ensure_ascii=False), bool(matches) and source == "scheduled"),
         )
     return snapshot_id
-
-
-STATE_LABELS = {"active": "在售", "sold": "已售", "delisted": "下架"}
 
 
 def latest_field(db, target_id, source, column, before):
@@ -497,6 +576,7 @@ def catalog_readings(db, products):
                FROM requested r JOIN targets t ON t.platform=r.platform AND t.kind='shop'
                JOIN shop_catalogs c ON c.target_id=t.id JOIN snapshots s ON s.id=c.snapshot_id
                JOIN json_each(c.items) i ON json_extract(i.value,'$.id')=r.external_id
+                 OR (r.platform='xiaohongshu' AND json_extract(i.value,'$.sku_id')=r.external_id)
            )
            SELECT platform,external_id,item,observed_at FROM matching WHERE rank=1""",
         (json.dumps(keys),),
@@ -508,6 +588,7 @@ def catalog_readings(db, products):
             "price_fen": item.get("price_fen"),
             "raw_sales": item.get("raw_sales") if row["platform"] == "xiaohongshu" else None,
             "want_count": item.get("want_count") if row["platform"] == "xianyu" else None,
+            "listed_at": item.get("listed_at"),
             "observed_at": row["observed_at"],
         }
     return result
@@ -519,16 +600,50 @@ def catalog_product_url(platform, item_id):
     return f"https://www.xiaohongshu.com/goods-detail/{item_id}"
 
 
+def catalog_product_id(platform, item):
+    return (item.get("sku_id") or item["id"]) if platform == "xiaohongshu" else item["id"]
+
+
+def search_catalog_products(db, platform, terms):
+    matches = db.execute(
+        """SELECT t.id AS shop_id,t.platform,coalesce(nullif(t.shop_name,''),t.title) AS shop_name,
+                  s.observed_at,i.value AS item
+           FROM targets t JOIN shop_catalogs c ON c.snapshot_id=(
+               SELECT snapshot_id FROM shop_catalogs WHERE target_id=t.id ORDER BY snapshot_id DESC LIMIT 1
+           ) JOIN snapshots s ON s.id=c.snapshot_id, json_each(c.items) i
+           WHERE t.kind='shop' AND t.deleted_at IS NULL AND (?='' OR t.platform=?)
+             AND NOT EXISTS (
+                 SELECT 1 FROM json_each(?) term WHERE instr(lower(
+                     json_extract(i.value,'$.title') || ' ' || json_extract(i.value,'$.id') || ' ' ||
+                     coalesce(json_extract(i.value,'$.sku_id'),'')),term.value)=0
+             ) ORDER BY s.observed_at DESC,t.id DESC,i.key""",
+        (platform, platform, terms),
+    )
+    shops = {}
+    for row in matches:
+        shop = shops.setdefault(row["shop_id"], dict(row) | {"items": []})
+        shop["items"].append(json.loads(row["item"]))
+    for shop in shops.values():
+        for item in catalog_products(db, shop, shop["platform"]):
+            yield item | {"kind": "product", "platform": shop["platform"], "id": item["target_id"],
+                          "shop_name": shop["shop_name"], "search_shop_id": shop["shop_id"],
+                          "catalog_match": True, "exact_sales": None}
+
+
 def catalog_products(db, catalog, platform):
     rows = db.execute(
-        """SELECT t.external_id,t.id AS target_id,
-                  p.price_fen,p.observed_at AS price_observed_at,
+        """SELECT json_extract(item.value,'$.id') AS catalog_id,t.id AS target_id,t.enabled,
+                  t.listed_at,p.price_fen,p.observed_at AS price_observed_at,
                   w.want_count,w.observed_at AS want_observed_at,
                   coalesce(v.raw_sales, CAST(v.exact_sales AS TEXT)) AS raw_sales,
-                  v.observed_at AS sales_observed_at
+                  v.observed_at AS sales_observed_at,
+                  d.hourly_delta,d.daily_delta
            FROM json_each(?) item
-           JOIN targets t ON t.platform=? AND t.kind='product' AND t.deleted_at IS NULL
-                           AND t.external_id=json_extract(item.value,'$.id')
+           JOIN targets t ON t.id=(SELECT p.id FROM targets p
+               WHERE p.platform=? AND p.kind='product' AND p.deleted_at IS NULL
+                 AND p.external_id IN (json_extract(item.value,'$.id'),
+                   CASE WHEN p.platform='xiaohongshu' THEN json_extract(item.value,'$.sku_id') END)
+               ORDER BY p.enabled DESC,p.id LIMIT 1)
            LEFT JOIN snapshots p ON p.id=(
                SELECT id FROM snapshots WHERE target_id=t.id AND price_fen IS NOT NULL
                ORDER BY observed_at DESC,id DESC LIMIT 1
@@ -540,13 +655,20 @@ def catalog_products(db, catalog, platform):
            LEFT JOIN snapshots v ON v.id=(
                SELECT id FROM snapshots WHERE target_id=t.id AND (raw_sales IS NOT NULL OR exact_sales IS NOT NULL)
                ORDER BY observed_at DESC,id DESC LIMIT 1
+           )
+           LEFT JOIN snapshots d ON d.id=(
+               SELECT id FROM snapshots WHERE target_id=t.id AND source IN ('scheduled','refresh')
+                 AND observed_at>=? AND observed_at>=t.active_since
+                 AND (hourly_delta IS NOT NULL OR daily_delta IS NOT NULL)
+               ORDER BY observed_at DESC,id DESC LIMIT 1
            )""",
-        (json.dumps(catalog["items"]), platform),
+        (json.dumps(catalog["items"]), platform, current_day_start()),
     )
-    readings = {row["external_id"]: row for row in rows}
+    readings = {row["catalog_id"]: row for row in rows}
     products = []
     for item in catalog["items"]:
         row = readings.get(item["id"])
+        product_id = catalog_product_id(platform, item)
         listing_price = item.get("price_fen")
         listing_time = catalog["observed_at"] if listing_price is not None else None
         price_at = row["price_observed_at"] if row else None
@@ -563,16 +685,21 @@ def catalog_products(db, catalog, platform):
             sales_at = catalog["observed_at"] if catalog_sales is not None else None
         products.append({
             "id": item["id"],
+            "external_id": product_id,
             "raw_sales": raw_sales,
             "sales_observed_at": sales_at,
             "title": item["title"],
-            "url": catalog_product_url(platform, item["id"]),
+            "listed_at": (row["listed_at"] if row else None) or item.get("listed_at"),
+            "url": catalog_product_url(platform, product_id),
             "target_id": row["target_id"] if row else None,
+            "monitoring": bool(row and row["enabled"]),
             "price_fen": price_fen,
             "price_observed_at": price_at,
             "price_source": price_source,
             "want_count": row["want_count"] if row else None,
             "want_observed_at": row["want_observed_at"] if row else None,
+            "hourly_delta": row["hourly_delta"] if row else None,
+            "daily_delta": row["daily_delta"] if row else None,
         })
     return products
 
@@ -582,7 +709,7 @@ def export_catalog(catalog, platform):
     writer = csv.writer(result)
     writer.writerow(["商品ID", "商品名称", "商品链接"])
     for item in catalog["items"]:
-        writer.writerow([item["id"], csv_cell(item["title"]), catalog_product_url(platform, item["id"])])
+        writer.writerow([item["id"], csv_cell(item["title"]), catalog_product_url(platform, catalog_product_id(platform, item))])
     return "\ufeff" + result.getvalue()
 
 

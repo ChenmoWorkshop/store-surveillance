@@ -18,8 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import platforms, worker, xhs_product
-from .models import ImportLinks, Reading, Rules, SamplingReview, TargetPatch, VisibleReading, xianyu_visible_reading
-from .storage import CST, ROOT, catalog_products, catalog_readings, daily_observations, database, dump_database, export_catalog, export_series, init, now, observation_jobs, observation_times, read_rules, recent_catalogs, record, restore_database, series, stamp, three_hour_delta, update_product_metadata
+from .models import ImportLinks, Reading, Rules, SamplingReview, ShopMonitoringChange, TargetPatch, VisibleReading, xianyu_visible_reading
+from .storage import CST, ROOT, catalog_product_id, catalog_product_url, catalog_products, catalog_readings, current_day_start, daily_observations, database, dump_database, export_catalog, export_series, init, now, observation_jobs, observation_times, read_rules, recent_catalogs, record, restore_database, search_catalog_products, series, stamp, three_hour_delta, update_product_metadata
 
 logger = logging.getLogger(__name__)
 CLOUD_MODE = os.getenv("MONITOR_CLOUD") == "1"
@@ -159,6 +159,9 @@ def import_links(body: ImportLinks):
                     raise ValueError("单批最多展开 10 条短链，请分批导入")
             # Resolve network redirects outside the database transaction.
             target = platforms.resolve(url)
+            if body.kind and target.kind != body.kind:
+                label = "商品链接" if target.kind == "product" else "店铺链接"
+                raise ValueError(f"这是{label}，请使用「添加{label}」入口")
         except ValueError as error:
             output.append({"url": url, "status": "rejected", "reason": str(error)})
             continue
@@ -192,8 +195,8 @@ def load_import_reading(items):
         for item in items:
             item["preview_error"] = "数据源未返回可核对的商品字段"
         return
-    wanted = ("price_fen", "want_count") if target["platform"] == "xianyu" else (
-        "price_fen", "raw_sales", "exact_sales",
+    wanted = ("price_fen", "want_count", "listed_at") if target["platform"] == "xianyu" else (
+        "price_fen", "raw_sales", "exact_sales", "listed_at",
     )
     metrics = {name: getattr(reading, name) for name in wanted if getattr(reading, name) is not None}
     if not metrics:
@@ -256,6 +259,8 @@ def save_import_target(url, target, shared_name):
                 (stamp(now()), row["id"]),
             )
             status = "restored"
+        if not created:
+            db.execute("UPDATE targets SET shop_only=0 WHERE id=? AND shop_only=1", (row["id"],))
         if not created and row["title"] != placeholder:
             title, title_source = row["title"], "saved"
         elif not created and title != placeholder:
@@ -291,21 +296,26 @@ def targets(platform: str = "", kind: str = "", q: str = Query("", max_length=16
     sort_field = sort.removesuffix("_asc")
     ascending = sort.endswith("_asc")
     sort_displayed = sort_field in ("price", "metric")
-    query_limit, query_offset = (-1, 0) if sort_displayed else (limit, offset)
+    terms = q.split()
+    query_limit, query_offset = (-1, 0) if sort_displayed or terms else (limit, offset)
     with database() as db:
-        params = (platform, platform, kind, kind, q, q)
+        term_json = json.dumps([term.lower() for term in terms])
+        params = (platform, platform, kind, kind, int(bool(terms)), term_json)
         where = """WHERE t.deleted_at IS NULL AND (?='' OR t.platform=?) AND (?='' OR t.kind=?)
-                   AND (?='' OR instr(lower(t.title || ' ' || t.external_id),lower(?))>0)"""
+                   AND (t.shop_only=0 OR ?=1) AND NOT EXISTS (
+                       SELECT 1 FROM json_each(?) term WHERE instr(lower(t.title || ' ' ||
+                         coalesce(t.official_title,'') || ' ' || t.external_id || ' ' ||
+                         CASE WHEN t.kind='shop' THEN coalesce(t.shop_name,'') ELSE '' END),term.value)=0
+                   )"""
         total = db.execute("SELECT count(*) FROM targets t " + where, params).fetchone()[0]
         column = {"daily": "p.daily_delta", "hourly": "p.hourly_delta"}.get(sort_field)
         order = "t.id DESC"
         if column:
             direction = "ASC" if ascending else "DESC"
-            order = f"{column} IS NULL,{column} {direction},t.id DESC"
+            order = f"coalesce({column},0) {direction},t.id DESC"
         if not kind:
             order = "t.kind <> 'product'," + order
-        local = now().astimezone(CST)
-        day_start = stamp(local.replace(hour=0, minute=0, second=0, microsecond=0))
+        day_start = current_day_start()
         rows = db.execute(
             """SELECT t.*,s.observed_at,v.raw_sales,v.exact_sales,pr.price_fen,pr.price_label,
                       (SELECT min(observed_at) FROM snapshots WHERE target_id=t.id AND source<>'catalog')
@@ -333,8 +343,10 @@ def targets(platform: str = "", kind: str = "", q: str = Query("", max_length=16
                  WHERE target_id=t.id AND price_fen IS NOT NULL ORDER BY observed_at DESC,id DESC LIMIT 1)
                LEFT JOIN import_readings i ON i.target_id=t.id
                LEFT JOIN snapshots p ON p.id=(SELECT id FROM snapshots
-                 WHERE target_id=t.id AND source='scheduled' AND slot>=?
-                 ORDER BY slot DESC LIMIT 1)
+                 WHERE target_id=t.id AND (source='scheduled' OR (t.kind='product' AND source='refresh'))
+                   AND observed_at>=? AND observed_at>=t.active_since
+                   AND (hourly_delta IS NOT NULL OR daily_delta IS NOT NULL)
+                 ORDER BY observed_at DESC,id DESC LIMIT 1)
                LEFT JOIN jobs j ON j.id=(SELECT MAX(id) FROM jobs WHERE target_id=t.id) """
             + where + " ORDER BY " + order + " LIMIT ? OFFSET ?", (day_start, *params, query_limit, query_offset),
         ).fetchall()
@@ -345,6 +357,7 @@ def targets(platform: str = "", kind: str = "", q: str = Query("", max_length=16
             )
         )]
         previews = catalog_readings(db, eligible)
+        catalog_matches = list(search_catalog_products(db, platform, term_json)) if terms and kind in ("", "product") else []
     items = []
     for row in rows:
         item = dict(row) | {"configured": platforms.target_configured(row["platform"], row["kind"])}
@@ -377,9 +390,31 @@ def targets(platform: str = "", kind: str = "", q: str = Query("", max_length=16
                 item.update(displayed)
                 item["catalog_observed_at"] = preview["observed_at"]
         items.append(item)
-    if sort_displayed:
+    if catalog_matches:
+        by_id = {item["id"]: item for item in items}
+        seen = {(item["platform"], item["external_id"]) for item in items if item["kind"] == "product"}
+        for match in catalog_matches:
+            existing = by_id.get(match["id"])
+            if existing:
+                existing.setdefault("search_shop_id", match["search_shop_id"])
+                existing["shop_name"] = existing.get("shop_name") or match["shop_name"]
+                continue
+            key = (match["platform"], match["external_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            if match["id"] is not None:
+                by_id[match["id"]] = match
+            items.append(match)
+        total = len(items)
+    if sort_displayed or terms:
         def sort_key(item):
-            value = item["price_fen"] if sort_field == "price" else displayed_metric_value(item)
+            if sort_field == "metric":
+                value = displayed_metric_value(item)
+            else:
+                value = item.get({"price": "price_fen", "daily": "daily_delta", "hourly": "hourly_delta"}.get(sort_field, "id"))
+                if sort_field in ("daily", "hourly") and value is None:
+                    value = 0
             return item["kind"] != "product", value is None, (value or 0) * (1 if ascending else -1)
 
         items.sort(key=sort_key)
@@ -514,6 +549,13 @@ def target_series(target_id: int, limit: int = Query(100, ge=1, le=1000)):
         observation = observation_times(db, target_id)
         if preview and (not observation["last_fetched_at"] or preview["observed_at"] > observation["last_fetched_at"]):
             observation["last_fetched_at"] = preview["observed_at"]
+        if target["kind"] == "product" and (not observation["last_fetched_at"] or not target["listed_at"]):
+            listing = catalog_readings(db, [target]).get((target["platform"], target["external_id"]))
+            if listing:
+                if not target["listed_at"]:
+                    target["listed_at"] = listing["listed_at"]
+                if not observation["last_fetched_at"]:
+                    observation["catalog_fetched_at"] = listing["observed_at"]
         hours = observation_jobs(db, target_id, min(max(limit, 3), 168))
         categories = [row["category"] for row in db.execute(
             "SELECT DISTINCT category FROM targets WHERE deleted_at IS NULL AND category IS NOT NULL ORDER BY category",
@@ -549,6 +591,8 @@ def shop_products(
             summary = {key: latest[key] for key in ("active_count", "observed_at", "source")}
             summary["has_more"] = bool(latest["has_more"])
             summary["complete"] = catalog_complete(latest)
+            summary["latest_listed_at"] = max((item["listed_at"] for item in latest["items"] if item.get("listed_at")),
+                                              default=None)
         observation = observation_times(db, target_id)
     return {
         "target": dict(target),
@@ -563,6 +607,58 @@ def shop_products(
 
 def catalog_complete(catalog):
     return not catalog["has_more"] and len(catalog["items"]) == catalog["active_count"]
+
+
+@app.post("/api/v1/targets/{target_id}/products/monitoring")
+def change_shop_monitoring(target_id: int, body: ShopMonitoringChange):
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        shop = get_target(db, target_id)
+        if shop["kind"] != "shop":
+            raise HTTPException(404, "该目标暂无店铺商品子页")
+        catalogs = recent_catalogs(db, target_id)
+        items = catalogs[0]["items"] if catalogs else []
+        if body.item_id is not None:
+            items = [item for item in items if item["id"] == body.item_id]
+            if not items:
+                raise HTTPException(404, "商品不在最新在售清单，请刷新店铺页面")
+        platform = shop["platform"]
+        active_since = stamp(now())
+        changed = 0
+        skipped = 0
+        for item in items:
+            product_id = catalog_product_id(platform, item)
+            matches = db.execute(
+                """SELECT id,enabled,deleted_at FROM targets
+                   WHERE platform=? AND kind='product' AND external_id IN (?,?)
+                   ORDER BY deleted_at IS NULL DESC,enabled DESC,external_id=? DESC""",
+                (platform, product_id, item["id"], product_id),
+            ).fetchall()
+            if not body.enabled:
+                for match in matches:
+                    if match["enabled"] and match["deleted_at"] is None:
+                        db.execute("UPDATE targets SET enabled=0 WHERE id=?", (match["id"],))
+                        db.execute("UPDATE jobs SET state='canceled' WHERE target_id=? AND state='queued'", (match["id"],))
+                        changed += 1
+                continue
+            if matches:
+                existing = matches[0]
+                if not existing["enabled"] or existing["deleted_at"] is not None:
+                    db.execute("UPDATE targets SET enabled=1,deleted_at=NULL,active_since=? WHERE id=?",
+                               (active_since, existing["id"]))
+                    changed += 1
+                continue
+            if platform == "xiaohongshu" and not item.get("sku_id"):
+                skipped += 1
+                continue
+            db.execute(
+                """INSERT INTO targets(platform,kind,external_id,url,title,active_since,shop_name,shop_only)
+                   VALUES (?,'product',?,?,?,?,?,1)""",
+                (platform, product_id, catalog_product_url(platform, product_id), item["title"][:160],
+                 active_since, shop["shop_name"] or shop["title"]),
+            )
+            changed += 1
+    return {"changed": changed, "skipped": skipped}
 
 
 def catalog_comparison(catalogs):

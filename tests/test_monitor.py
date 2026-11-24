@@ -83,6 +83,23 @@ class MonitorTest(unittest.TestCase):
         wrong, = import_links(ImportLinks(text=f"【小红书】错误标题 😆 abc123 😆 {fish.replace('12345','12346')}"))["items"]
         self.assertEqual((wrong["platform"], wrong["title_source"]), ("xianyu", "unavailable"))
 
+    def test_import_modes_only_save_links_matching_the_selected_kind(self):
+        from monitor.app import import_links
+        from monitor.models import ImportLinks
+
+        fish = "https://www.goofish.com/item?id=12345"
+        book = "https://www.xiaohongshu.com/goods-detail/abcdef1234567890"
+        shop = "https://www.goofish.com/personal?userId=56789"
+        with patch.object(platforms, "target_configured", return_value=False):
+            products = import_links(ImportLinks(text="\n".join([fish, book, shop]), kind="product"))["items"]
+            self.assertEqual([item["status"] for item in products], ["created", "created", "rejected"])
+            self.assertIn("添加店铺链接", products[-1]["reason"])
+            with storage.database() as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM targets WHERE kind='shop'").fetchone()[0], 0)
+            shops = import_links(ImportLinks(text=shop + "\n" + fish, kind="shop"))["items"]
+        self.assertEqual([item["status"] for item in shops], ["created", "rejected"])
+        self.assertIn("添加商品链接", shops[-1]["reason"])
+
     def test_visible_xianyu_text_records_active_price_and_want_count(self):
         from monitor.app import add_visible_reading, target_series
         from monitor.models import VisibleReading, xianyu_visible_reading
@@ -116,6 +133,93 @@ class MonitorTest(unittest.TestCase):
         Reading.model_validate(result)
         with self.assertRaises(ValueError):
             xianyu_product.parse_detail(payload, "999999")
+
+    def test_product_status_distinguishes_explicit_removal_from_access_errors(self):
+        item_id = "a" * 24
+        product = {
+            "descriptionH5": {"skuId": item_id},
+            "priceH5": {"highlightPrice": "3.98", "itemAnalysisDataText": "已售2027"},
+        }
+        payload = {"success": True, "data": {"template_data": [product]}}
+        self.assertNotIn("listing_state", xhs_product.parse_json_product(payload, item_id))
+        product["bottomBarMainH5"] = {"buttons": [{"text": "立即购买", "type": "instantBuy", "actionType": "instantBuy"}]}
+        self.assertEqual(xhs_product.parse_json_product(payload, item_id)["listing_state"], "active")
+        for message, expected in (("该商品已下架", "delisted"), ("该商品因违规被删除", "removed_violation"),
+                                  ("商品不存在", "unavailable")):
+            with self.subTest(message=message):
+                xhs = xhs_product.parse_json_product({"success": False, "msg": message}, item_id)
+                fish = xianyu_product.parse_detail({"ret": ["FAIL_ITEM::" + message]}, "123456")
+                self.assertEqual(Reading.model_validate(xhs).listing_state, expected)
+                self.assertEqual(Reading.model_validate(fish).listing_state, expected)
+        with self.assertRaises(ValueError):
+            xhs_product.parse_json_product({"success": False, "msg": "请登录"}, item_id)
+        with self.assertRaises(RuntimeError):
+            xianyu_product.parse_detail({"ret": ["FAIL_ACCESS::访问受限"]}, "123456")
+
+    def test_product_and_shop_metadata_survives_samples_without_metadata(self):
+        from monitor.app import shop_products, target_series
+
+        product = self.target("xianyu", "12345")
+        with storage.database() as db:
+            shop_id = db.execute(
+                """INSERT INTO targets(platform,kind,external_id,url,title,active_since)
+                   VALUES('xianyu','shop','56789','https://www.goofish.com/personal?userId=56789','店铺',?)""",
+                (storage.stamp(self.slot),),
+            ).lastrowid
+            shop = dict(db.execute("SELECT * FROM targets WHERE id=?", (shop_id,)).fetchone())
+            catalog = {"active_count": 1, "items": [{"id": "12345", "title": "商品"}]}
+            storage.record(db, shop, Reading(follower_count=0, shop_opened_at="2020-07-01", shop_catalog=catalog),
+                           self.slot, "refresh")
+            storage.record(db, shop, Reading(shop_catalog=catalog), self.slot + timedelta(minutes=10), "refresh")
+        self.assertIn("catalog_fetched_at", target_series(product["id"], 10)["observation"])
+        with storage.database() as db:
+            storage.record(db, product, Reading(listed_at="2024-08-15T18:05:31+08:00"), self.slot, "refresh")
+            storage.record(db, product, Reading(price_fen=800, listed_at="unknown"),
+                           self.slot + timedelta(minutes=11), "refresh")
+        saved = shop_products(shop_id)
+        self.assertEqual((saved["target"]["follower_count"], saved["target"]["shop_opened_at"]), (0, "2020-07-01"))
+        self.assertEqual(saved["latest"]["observed_at"], storage.stamp(self.slot + timedelta(minutes=10)))
+        detail = target_series(product["id"], 10)
+        self.assertEqual(detail["target"]["listed_at"], "2024-08-15T10:05:31+00:00")
+        self.assertEqual(detail["observation"]["last_fetched_at"], storage.stamp(self.slot + timedelta(minutes=11)))
+
+    def test_shop_listing_dates_use_public_shelf_time_and_match_product_sku(self):
+        from monitor.app import shop_products, target_series
+
+        seller_id = "c" * 24
+        product = self.target("xiaohongshu", "a" * 24)
+        source = {"componentVOList": [{"defaultGoodsComponentVO": {"baseInfo": {
+            "sellerId": seller_id, "itemId": "b" * 24, "skuId": product["external_id"], "title": "上新商品",
+            "itemOnShelfTime": 1753295040, "itemOnShelfTimeFormatZero": 1792684800,
+        }}}]}
+        catalog = {"active_count": 1, "items": list(xhs_public.goods_items(source, seller_id).values())}
+        with storage.database() as db:
+            shop_id = db.execute(
+                """INSERT INTO targets(platform,kind,external_id,url,title,active_since)
+                   VALUES('xiaohongshu','shop',?,'https://www.xiaohongshu.com/shop/','店铺',?)""",
+                (seller_id, storage.stamp(self.slot)),
+            ).lastrowid
+            shop = dict(db.execute("SELECT * FROM targets WHERE id=?", (shop_id,)).fetchone())
+            storage.record(db, shop, Reading(shop_catalog=catalog), self.slot, "scheduled", self.slot)
+        expected = storage.stamp(datetime.fromtimestamp(1753295040, storage.CST))
+        results = shop_products(shop_id)
+        self.assertEqual(results["products"][0]["listed_at"], expected)
+        self.assertEqual(results["latest"]["latest_listed_at"], expected)
+        self.assertEqual(target_series(product["id"], 10)["target"]["listed_at"], expected)
+
+    def test_legacy_readable_products_are_backfilled_once(self):
+        target = self.target("xiaohongshu", "sample")
+        self.add(target, 0, exact_sales=20)
+        self.add(target, 1, price_fen=399, listing_state="delisted")
+        with storage.database() as db:
+            storage.record(db, target, Reading(price_fen=399), self.slot + timedelta(hours=2), "manual")
+            db.execute("PRAGMA user_version=1")
+        storage.init()
+        self.add(target, 3, exact_sales=21)
+        storage.init()
+        with storage.database() as db:
+            self.assertEqual([row["listing_state"] for row in storage.series(db, target["id"], 10)],
+                             [None, None, "delisted", "active"])
 
     def test_shop_deltas_follow_active_listing_count(self):
         with storage.database() as db:
@@ -173,6 +277,31 @@ class MonitorTest(unittest.TestCase):
             self.assertEqual(storage.recompute_deltas(db), 3)
             replayed = [(row["hourly_delta"], row["daily_delta"]) for row in storage.series(db, target["id"], 10)]
             self.assertEqual(replayed, expected)
+
+    def test_refresh_counts_from_previous_valid_sample_and_keeps_first_daily_baseline(self):
+        from monitor.app import refresh_target, targets
+
+        target = self.target("xiaohongshu", "demo")
+        start = self.slot - timedelta(minutes=36)
+        samples = [(start, 7275), (self.slot + timedelta(minutes=16), 7281),
+                   (self.slot + timedelta(minutes=23), 7281)]
+        with patch.object(platforms, "target_configured", return_value=True):
+            for index, (instant, count) in enumerate(samples):
+                if index == 1:
+                    self.add(target, 0, exact_sales=7278)
+                with patch("monitor.app.now", return_value=instant), patch.object(platforms, "observe", return_value={"exact_sales": count}):
+                    refresh_target(target["id"])
+
+        with storage.database() as db:
+            expected = [(0, 6), (3, 6), (None, 3), (0, 0)]
+            self.assertEqual([(r["hourly_delta"], r["daily_delta"]) for r in storage.series(db, target["id"], 10)], expected)
+            db.execute("UPDATE snapshots SET hourly_delta=NULL,daily_delta=NULL,daily_baseline_at=NULL")
+            storage.recompute_deltas(db)
+            self.assertEqual([(r["hourly_delta"], r["daily_delta"]) for r in storage.series(db, target["id"], 10)], expected)
+            self.assertEqual(db.execute("SELECT count(*) FROM events").fetchone()[0], 0)
+        with patch.object(storage, "now", return_value=samples[-1][0]):
+            item, = targets(q="", offset=0, limit=20)["items"]
+        self.assertEqual((item["hourly_delta"], item["daily_delta"]), (0, 6))
 
     def test_idle_state_transition_is_not_sales(self):
         target = self.target("xianyu", "12345")
@@ -401,6 +530,94 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual([item["id"] for item in last["products"]], ["10500", "10501", "10502"])
         self.assertEqual(last["latest"]["active_count"], 520)
         self.assertNotIn("items", last["latest"])
+
+    def test_search_finds_catalog_links_without_duplicating_monitored_products(self):
+        from monitor.app import targets
+
+        standalone = self.target("xiaohongshu", "a" * 24)
+        shop_only = self.target("xiaohongshu", "b" * 24)
+        with storage.database() as db:
+            db.execute("UPDATE targets SET title='剪映 调色' WHERE id=?", (standalone["id"],))
+            db.execute("UPDATE targets SET shop_only=1,title='剪映 调色包' WHERE id=?", (shop_only["id"],))
+            shop_id = db.execute(
+                """INSERT INTO targets(platform,kind,external_id,url,title,shop_name,active_since)
+                   VALUES('xiaohongshu','shop',?,'https://www.xiaohongshu.com/shop/','店铺编号','文行文化',?)""",
+                ("c" * 24, storage.stamp(self.slot)),
+            ).lastrowid
+            shop = dict(db.execute("SELECT * FROM targets WHERE id=?", (shop_id,)).fetchone())
+            old = [{"id": "d" * 24, "title": "剪映 旧链接"}]
+            active = [
+                {"id": "e" * 24, "sku_id": "a" * 24, "title": "剪映 调色", "price_fen": 230},
+                {"id": "b" * 24, "title": "剪映 调色包", "price_fen": 540},
+                {"id": "f" * 24, "title": "剪映 LUT 调色包", "price_fen": 100},
+            ]
+            for offset, items in enumerate((old, active)):
+                storage.record(db, shop, Reading(shop_catalog={"active_count": len(items), "items": items}),
+                               self.slot + timedelta(hours=offset), "manual")
+
+        pool = targets(q="", offset=0, limit=20)
+        self.assertEqual({item["id"] for item in pool["items"]}, {standalone["id"], shop_id})
+        matches = targets(q="剪映 调色", sort="price_asc", offset=0, limit=2)
+        self.assertEqual(matches["total"], 3)
+        self.assertEqual([item["id"] for item in matches["items"]], [None, standalone["id"]])
+        self.assertTrue(all(item["search_shop_id"] == shop_id for item in matches["items"]))
+        rest = targets(q="剪映 调色", kind="product", sort="price_asc", offset=2, limit=2)
+        self.assertEqual(rest["items"][0]["id"], shop_only["id"])
+        self.assertEqual(targets(q="LUT", platform="xianyu", offset=0, limit=20)["total"], 0)
+        self.assertEqual(targets(q="lut", kind="shop", offset=0, limit=20)["total"], 0)
+        self.assertEqual(targets(q="文行文化", offset=0, limit=20)["items"][0]["id"], shop_id)
+        self.assertEqual(targets(q="旧链接", offset=0, limit=20)["total"], 0)
+        self.assertEqual(targets(q="e" * 24, offset=0, limit=20)["items"][0]["id"], standalone["id"])
+
+    def test_shop_products_keep_sampling_outside_the_root_list(self):
+        from monitor.app import change_shop_monitoring, save_import_target, shop_products, target_series, targets
+        from monitor.models import ShopMonitoringChange
+
+        standalone = self.target("xianyu", "12345")
+        with storage.database() as db:
+            shop_id = db.execute(
+                """INSERT INTO targets(platform,kind,external_id,url,title,active_since)
+                   VALUES('xianyu','shop','56789','https://www.goofish.com/personal?userId=56789','店铺',?)""",
+                (storage.stamp(self.slot),),
+            ).lastrowid
+            shop = dict(db.execute("SELECT * FROM targets WHERE id=?", (shop_id,)).fetchone())
+            items = [{"id": "12345", "title": "单独添加"}, {"id": "12346", "title": "店铺添加"}]
+            storage.record(db, shop, Reading(shop_catalog={"active_count": 2, "items": items}), self.slot, "manual")
+
+        with patch("monitor.app.now", return_value=self.slot):
+            change_shop_monitoring(shop_id, ShopMonitoringChange(enabled=True))
+        products = shop_products(shop_id)["products"]
+        self.assertTrue(all(item["monitoring"] for item in products))
+        shop_product_id = products[1]["target_id"]
+        self.assertIsNone(products[1]["hourly_delta"])
+        self.assertIsNone(products[1]["daily_delta"])
+        self.assertEqual([item["id"] for item in targets(q="", offset=0, limit=20)["items"]],
+                         [standalone["id"], shop_id])
+        self.assertEqual(targets(kind="product", sort="price", q="", offset=0, limit=20)["total"], 1)
+
+        with storage.database() as db:
+            product = dict(db.execute("SELECT * FROM targets WHERE id=?", (shop_product_id,)).fetchone())
+            storage.record(db, product, Reading(want_count=5), self.slot, "scheduled", self.slot)
+        with (patch.object(worker, "now", return_value=self.slot + timedelta(hours=1, minutes=5)),
+              patch.object(worker, "target_configured", side_effect=lambda platform, kind: kind == "product"),
+              patch.object(worker, "observe", return_value={"want_count": 7}),
+              patch.object(worker, "send_pending"), patch.object(worker, "queue_deliveries")):
+            worker.cycle()
+        self.assertEqual(target_series(shop_product_id, 10)["items"][0]["want_count"], 7)
+        with patch.object(storage, "now", return_value=self.slot + timedelta(hours=1)):
+            sampled = shop_products(shop_id)["products"][1]
+            self.assertEqual((sampled["hourly_delta"], sampled["daily_delta"]), (2, 2))
+        with patch.object(storage, "now", return_value=self.slot + timedelta(days=1)):
+            previous = shop_products(shop_id)["products"][1]
+            self.assertEqual((previous["hourly_delta"], previous["daily_delta"]), (None, None))
+        change_shop_monitoring(shop_id, ShopMonitoringChange(enabled=False, item_id="12346"))
+        self.assertFalse(shop_products(shop_id)["products"][1]["monitoring"])
+
+        url = "https://www.goofish.com/item?id=12346"
+        save_import_target(url, platforms.resolve(url), None)
+        root = targets(kind="product", q="", offset=0, limit=20)["items"]
+        self.assertEqual([item["id"] for item in root], [shop_product_id, standalone["id"]])
+        self.assertEqual(target_series(shop_product_id, 10)["items"][0]["want_count"], 7)
 
     def test_delete_stops_sampling_and_reimport_restores_history(self):
         from fastapi import HTTPException

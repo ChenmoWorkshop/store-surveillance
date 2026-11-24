@@ -2,7 +2,7 @@
 
 const byId = (id) => document.getElementById(id);
 const platformNames = {xianyu: "闲鱼", xiaohongshu: "小红书"};
-const states = {active: "在售", sold: "已售", delisted: "下架"};
+const states = {active: "在售", sold: "已售／售罄", delisted: "已下架", removed_violation: "违规删除", unavailable: "链接不可用"};
 const jobNames = {queued: "待采样", success: "成功", missed: "缺采", failed: "失败", canceled: "已取消", unavailable: "无数据源"};
 const deliveryNames = {queued: "待发送", sent: "已送达", unknown: "待核查"};
 const sourceNames = {manual: "手工录入", refresh: "立即采样", scheduled: "定时采样", catalog: "店铺商品快照"};
@@ -18,8 +18,19 @@ const observationFormat = new Intl.DateTimeFormat("zh-CN", {
   hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
 });
 const observedTime = (value) => value ? observationFormat.format(new Date(value)) : "—";
+const unknownMetadata = "暂无数据";
+const collectedTime = (value) => value ? observedTime(value) : unknownMetadata;
+const metadataDate = (value) => value?.length === 10 ? value : collectedTime(value);
+function elapsedAge(value) {
+  if (!value) return unknownMetadata;
+  const dayOnly = value.length === 10;
+  const now = dayOnly ? Date.parse(dayFormat.format(new Date()) + "T00:00:00+08:00") : Date.now();
+  const start = Date.parse(dayOnly ? value + "T00:00:00+08:00" : value);
+  const days = Math.floor((now - start) / 86_400_000);
+  return days > 0 ? days.toLocaleString("zh-CN") + " 天" : days === 0 ? "不到 1 天" : unknownMetadata;
+}
 const delta = (value) => value == null ? "—" : (value > 0 ? "+" : "") + value;
-const deltaOrZero = (value, readable) => value == null ? (readable ? "0" : "—") : delta(value);
+const deltaOrZero = (value) => delta(value ?? 0);
 // 增量按哪个字段计算，与后端 metric_column 一致：小红书看精确展示销量，闲鱼商品看想要数，闲鱼店铺看在售数。
 // 与后端 metric_column 保持一致：店铺看采集到的在售数，小红书商品看精确销量，闲鱼商品看想要数。
 const deltaMetric = (row, target) => target.kind === "shop"
@@ -66,6 +77,7 @@ let shopRequest = 0;
 let shopPage = 1;
 let shopPageCount = 1;
 const collectingShops = new Set();
+const updatingShopMonitoring = new Set();
 const pageSize = 50;
 
 function node(tag, value, className) {
@@ -159,24 +171,54 @@ async function loadPool() {
   byId("next").disabled = offset + pageSize >= total;
 }
 
+function targetName(item) {
+  return item.kind === "shop" && item.platform === "xiaohongshu" ? item.shop_name || item.title : item.title;
+}
+
+function linkToShop(link, id, beforeOpen) {
+  link.href = "#shop/" + id;
+  link.addEventListener("click", (event) => {
+    if (event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    beforeOpen?.();
+    if (location.hash !== link.hash) history.pushState({shopBack: true}, "", link.hash);
+    perform(route);
+  });
+}
+
 function targetRow(item) {
   const row = node("tr");
   const target = node("td");
-  const button = node(item.kind === "shop" ? "a" : "button", item.title, "target-button");
-  button.title = item.title;
-  if (item.kind === "shop") button.href = "#shop/" + item.id;
+  const catalogLink = item.catalog_match && item.id == null;
+  const button = node(item.kind === "shop" || catalogLink ? "a" : "button", targetName(item),
+    item.kind === "shop" ? "target-button shop-target-button" : "target-button");
+  button.title = targetName(item);
+  if (item.kind === "shop") linkToShop(button, item.id);
+  else if (catalogLink) {
+    button.href = item.url;
+    button.target = "_blank";
+    button.rel = "noopener noreferrer";
+  }
   else button.addEventListener("click", () => perform(() => openDetail(item.id)));
   const meta = node("span", null, "meta");
   meta.append(node("span", platformNames[item.platform], "badge " + item.platform),
     document.createTextNode(item.kind === "product" ? " 商品" : " 店铺"));
   target.append(button, meta);
+  if (item.search_shop_id != null) {
+    const shop = node("a", item.shop_name || "查看店铺");
+    linkToShop(shop, item.search_shop_id);
+    meta.append(document.createTextNode(" · "), shop);
+  } else if (item.shop_only && item.shop_name) {
+    meta.append(document.createTextNode(" · " + item.shop_name));
+  }
+  if (targetName(item) !== item.title) target.append(node("span", item.title, "meta"));
   const statusCell = node("td");
-  const monitoring = item.enabled && item.configured;
-  const statusLabel = !item.enabled ? "已暂停" : monitoring ? "监控中" : "待配置数据源";
+  const monitoring = item.catalog_match ? item.monitoring : item.enabled && item.configured;
+  const statusLabel = monitoring ? "监控中" : catalogLink ? "未加入单品监控" : !item.enabled ? "已暂停" : "待配置数据源";
   statusCell.append(node("span", statusLabel, "badge " + (monitoring ? "monitoring" : "")));
   const samplingIssue = item.job_state === "failed" || item.job_state === "unavailable";
   if (monitoring && samplingIssue && !item.sampling_recovered) {
-    const canReview = item.kind === "product" && item.listing_state !== "delisted";
+    const canReview = item.kind === "product" && !["delisted", "removed_violation"].includes(item.listing_state);
     statusCell.title = item.job_error || "";
     if (canReview && item.reviewed_sampling_slot && item.reviewed_sampling_slot === item.job_slot) {
       statusCell.append(node("span", "已打开核对 · 上次采样失败", "meta"));
@@ -204,12 +246,20 @@ function targetRow(item) {
   }
   const displayedPrice = node("td", price(item.price_fen));
   if (item.price_label) displayedPrice.append(node("span", item.price_label, "meta"));
-  const readable = item.enabled && item.configured && deltaMetric(item, item) != null;
   row.append(target, displayedPrice, node("td", metric(item, item) ?? "—"),
-    node("td", deltaOrZero(item.hourly_delta, readable)), node("td", deltaOrZero(item.daily_delta, readable)),
+    node("td", deltaOrZero(item.hourly_delta)), node("td", deltaOrZero(item.daily_delta)),
     statusCell, node("td", observedTime(item.first_observed_at)),
     node("td", observedTime(item.last_observed_at)));
   const action = node("td");
+  if (item.catalog_match || item.shop_only) {
+    if (item.search_shop_id != null) {
+      const shop = node("a", "查看店铺");
+      linkToShop(shop, item.search_shop_id);
+      action.append(shop);
+    }
+    row.append(action);
+    return row;
+  }
   const remove = node("button", "删除", "danger");
   remove.type = "button";
   remove.setAttribute("aria-label", "删除 " + item.title);
@@ -236,7 +286,7 @@ async function openDetail(id) {
   currentReadings = items;
   dailyRows = days;
   if (changed) dailyPage = 0;
-  renderTargetSummary(target, items, hours, days, preview, threeHour);
+  renderTargetSummary(target, items, days, preview, threeHour);
   renderDetailCategory(target, categories);
   renderDailyTable();
   if (changed) showDetailView(target.kind === "shop" ? "hourly" : "daily");
@@ -250,17 +300,24 @@ async function openDetail(id) {
   byId("download").hidden = false;
   byId("detail-metric").textContent = target.kind === "shop" ? "在售数"
     : wants ? "想要数" : target.platform === "xiaohongshu" ? "展示销量" : "商品读数";
+  byId("listing-state-note").hidden = target.kind !== "product";
   byId("want-field").hidden = !wants;
   byId("visible-reading-form").hidden = !wants;
   byId("sales-field").hidden = target.platform !== "xiaohongshu";
   byId("chart-metric-label").hidden = !wants;
   if (changed) byId("chart-metric").value = items.some((item) => item.want_count != null) ? "want_count" : "price_fen";
-  byId("detail-title").textContent = target.official_title || target.title;
+  byId("detail-title").textContent = target.official_title || targetName(target);
   byId("detail-platform").textContent = platformNames[target.platform] + (target.kind === "product" ? " · 商品详情" : " · 店铺详情");
   byId("detail-platform-id").textContent = "ID " + target.external_id;
   byId("detail-shop-name").hidden = target.kind !== "product";
   byId("detail-shop-name").textContent = "店铺 " + (target.shop_name || "—");
-  byId("detail-last-fetched").textContent = "最近抓取 " + observedTime(observation.last_fetched_at);
+  byId("detail-listed-at").hidden = target.kind !== "product";
+  byId("detail-listing-age").hidden = target.kind !== "product";
+  byId("detail-listed-at").textContent = "上架时间 " + metadataDate(target.listed_at);
+  byId("detail-listing-age").textContent = "上架时长 " + elapsedAge(target.listed_at);
+  const fromCatalog = !observation.last_fetched_at && observation.catalog_fetched_at;
+  byId("detail-last-fetched").textContent = "采集时间 " + collectedTime(observation.last_fetched_at || fromCatalog)
+    + (fromCatalog ? "（店铺清单）" : "");
   const cover = byId("detail-cover");
   cover.hidden = !target.cover_url;
   if (target.cover_url) cover.src = target.cover_url;
@@ -283,8 +340,8 @@ async function openDetail(id) {
     const notes = {counter_reset: "计数回退", display_only: "仅展示值"};
     if (target.platform === "xiaohongshu" && notes[item.quality]) value.append(node("span", notes[item.quality], "meta"));
     row.append(observed, value, node("td", price(item.price_fen)),
-      node("td", states[item.listing_state] || "—"),
-      node("td", delta(item.hourly_delta)), node("td", delta(item.daily_delta)));
+      listingStateCell(item, target),
+      node("td", deltaOrZero(item.hourly_delta)), node("td", deltaOrZero(item.daily_delta)));
     return row;
   });
   if (!rows.length) {
@@ -305,12 +362,24 @@ async function openDetail(id) {
   }
 }
 
+function listingStateCell(item, target) {
+  if (target.kind !== "product") return node("td", "不适用");
+  const label = states[item.listing_state];
+  const cell = node("td", label || "待确认");
+  if (!label && (metric(item, target) != null || item.price_fen != null)) {
+    cell.append(node("span", "详情可读，状态未记录", "meta"));
+  } else if (item.listing_state === "unavailable") {
+    cell.append(node("span", "平台未说明具体原因", "meta"));
+  }
+  return cell;
+}
+
 function detailMetricName(target) {
   if (target.platform === "xiaohongshu") return "展示销量";
   return target.kind === "shop" ? "在售数" : "想要数";
 }
 
-function renderTargetSummary(target, items, hours, days, preview, threeHour) {
+function renderTargetSummary(target, items, days, preview, threeHour) {
   const key = detailMetricName(target);
   byId("detail-count-label").textContent = target.platform === "xiaohongshu" ? "总销量" : key;
   byId("daily-metric-label").textContent = key;
@@ -329,13 +398,14 @@ function renderTargetSummary(target, items, hours, days, preview, threeHour) {
   ) ? preview : priceReading;
   byId("detail-price-label").textContent = readPrice?.price_label || "观测价格";
   byId("detail-current-price").textContent = price(readPrice?.price_fen);
-  const hour = hours.find((item) => item.state === "success");
-  const today = hour && dayFormat.format(new Date(hour.slot)) === dayFormat.format(new Date());
-  const latestHour = hours[0];
-  const latestReadable = latestHour?.state === "success" && deltaMetric(latestHour, target) != null;
-  byId("detail-today-change").textContent = today ? delta(hour.daily_delta ?? 0) : "—";
-  byId("detail-hour-change").textContent = deltaOrZero(latestHour?.hourly_delta, latestReadable);
-  byId("detail-three-hour-change").textContent = delta(threeHour);
+  const today = dayFormat.format(new Date());
+  const latestSample = items.find((item) => (item.source === "scheduled" ||
+    (target.kind === "product" && item.source === "refresh")) &&
+    item.observed_at >= target.active_since && dayFormat.format(new Date(item.observed_at)) === today &&
+    (item.hourly_delta != null || item.daily_delta != null));
+  byId("detail-today-change").textContent = deltaOrZero(latestSample?.daily_delta);
+  byId("detail-hour-change").textContent = deltaOrZero(latestSample?.hourly_delta);
+  byId("detail-three-hour-change").textContent = deltaOrZero(threeHour);
 }
 
 function renderDetailCategory(target, customCategories) {
@@ -377,7 +447,7 @@ function renderDailyTable() {
   const list = byId("daily-history");
   const rows = items.map((item) => {
     const row = node("tr");
-    const change = node("td", delta(item.delta), item.delta > 0 ? "delta-positive" : item.delta < 0 ? "delta-negative" : "");
+    const change = node("td", deltaOrZero(item.delta), item.delta > 0 ? "delta-positive" : item.delta < 0 ? "delta-negative" : "");
     row.append(node("td", item.day), node("td", observedTime(item.observed_at)),
       node("td", item.display ?? item.value ?? "—"), change);
     return row;
@@ -508,8 +578,8 @@ function renderHourly(target, hours) {
       status.title = hour.error;
       status.append(node("span", hour.error, "meta"));
     }
-    const hourlyCell = node("td", deltaOrZero(hour.hourly_delta, readable));
-    const dailyCell = node("td", deltaOrZero(hour.daily_delta, readable));
+    const hourlyCell = node("td", deltaOrZero(hour.hourly_delta));
+    const dailyCell = node("td", deltaOrZero(hour.daily_delta));
     if (readable && hour.hourly_delta != null) {
       // 中间整点缺采时，后端会回溯到最近一条有效读数，这里如实标出实际跨度。
       const earlier = readableHours.find((item) => item.slot < hour.slot);
@@ -531,7 +601,13 @@ async function loadShop() {
   const {target, latest, observation, comparison, products, pagination} =
     await request("/targets/" + shopId + "/products?" + params);
   if (version !== shopRequest || activeView !== "shop-page") return;
-  byId("shop-name").textContent = target.title + "的商品";
+  byId("shop-name").textContent = targetName(target);
+  byId("shop-profile").textContent = "粉丝数量 " + (target.follower_count?.toLocaleString("zh-CN") ?? unknownMetadata)
+    + " · 开店时长 " + elapsedAge(target.shop_opened_at)
+    + " · 采集时间 " + collectedTime(latest?.observed_at ?? observation.last_fetched_at);
+  if (latest?.latest_listed_at) {
+    byId("shop-profile").textContent += " · 最近上新（已采商品）距今 " + elapsedAge(latest.latest_listed_at);
+  }
   byId("shop-observation-times").textContent =
     "首次观测 " + observedTime(observation.first_observed_at) + " · 最后观测 " + observedTime(observation.last_observed_at);
   const xhs = target.platform === "xiaohongshu";
@@ -546,6 +622,9 @@ async function loadShop() {
   const download = byId("shop-catalog-download");
   const list = byId("shop-catalog-items");
   const {page, page_count: pageCount, total, offset: first} = pagination;
+  const updating = updatingShopMonitoring.has(target.id);
+  byId("monitor-shop-all").disabled = updating || !total;
+  byId("pause-shop-all").disabled = updating || !total;
   shopPage = page;
   shopPageCount = pageCount;
   byId("shop-prev").disabled = page <= 1;
@@ -577,17 +656,17 @@ async function loadShop() {
   download.textContent = latest?.complete ? "导出商品链接 CSV" : "导出已采商品 CSV";
   download.href = "/api/v1/targets/" + target.id + "/catalog.csv";
   if (products.length) {
-    list.replaceChildren(...products.map((item, index) => shopProductRow(item, first + index + 1, xhs)));
+    list.replaceChildren(...products.map((item, index) => shopProductRow(item, first + index + 1, xhs, target.id, updating)));
   } else {
     const row = node("tr");
     const cell = node("td", "暂无已采集商品。");
-    cell.colSpan = 5;
+    cell.colSpan = 7;
     row.append(cell);
     list.replaceChildren(row);
   }
 }
 
-function shopProductRow(item, number, xhs) {
+function shopProductRow(item, number, xhs, id, updating) {
   const row = node("tr");
   const product = node("td");
   const link = node("a", item.title, "shop-product-link");
@@ -595,6 +674,11 @@ function shopProductRow(item, number, xhs) {
   link.target = "_blank";
   link.rel = "noopener noreferrer";
   product.append(link, node("span", item.id, "meta"));
+  if (item.listed_at) {
+    const age = node("span", "已上架 " + elapsedAge(item.listed_at), "meta");
+    age.title = "上架时间 " + metadataDate(item.listed_at);
+    product.append(age);
+  }
 
   const cost = node("td", price(item.price_fen));
   if (item.price_observed_at) {
@@ -606,15 +690,52 @@ function shopProductRow(item, number, xhs) {
   if (metricAt) metric.append(node("span", time(metricAt), "meta"));
 
   const action = node("td");
+  const actions = node("div", null, "shop-monitor-actions");
+  if (item.monitoring) actions.append(node("span", "监控中", "badge monitoring"));
+  else {
+    const enable = node("button", item.target_id == null ? "加入监控" : "恢复监控");
+    enable.type = "button";
+    enable.disabled = updating;
+    enable.dataset.shopMonitor = "";
+    enable.addEventListener("click", () => changeShopMonitoring(id, true, item.id));
+    actions.append(enable);
+  }
   if (item.target_id != null) {
     const details = node("button", "查看记录");
     details.addEventListener("click", () => perform(() => openDetail(item.target_id)));
-    action.append(details);
-  } else {
-    action.textContent = "未加入单品监控";
+    actions.append(details);
   }
-  row.append(node("td", number, "shop-row-number"), product, cost, metric, action);
+  action.append(actions);
+  row.append(node("td", number, "shop-row-number"), product, cost, metric,
+    node("td", deltaOrZero(item.hourly_delta)), node("td", deltaOrZero(item.daily_delta)), action);
   return row;
+}
+
+async function changeShopMonitoring(id, enabled, itemId) {
+  if (updatingShopMonitoring.has(id)) return;
+  updatingShopMonitoring.add(id);
+  const stillHere = () => activeView === "shop-page" && shopId === id;
+  const notice = byId("shop-monitor-message");
+  notice.hidden = false;
+  notice.textContent = "正在更新单品监控…";
+  document.querySelectorAll("#monitor-shop-all, #pause-shop-all, [data-shop-monitor]").forEach((button) => { button.disabled = true; });
+  try {
+    let result = await request("/targets/" + id + "/products/monitoring", "POST", {enabled, item_id: itemId});
+    if (enabled && result.skipped) {
+      await request("/targets/" + id + "/refresh", "POST");
+      const retry = await request("/targets/" + id + "/products/monitoring", "POST", {enabled, item_id: itemId});
+      result = {changed: result.changed + retry.changed, skipped: retry.skipped};
+    }
+    if (stillHere()) {
+      notice.textContent = (enabled ? "已启用 " : "已暂停 ") + result.changed + " 件商品的监控"
+        + (result.skipped ? " · " + result.skipped + " 件缺少可用商品链接，待补采" : "");
+    }
+  } catch (error) {
+    if (stillHere()) notice.textContent = error.message;
+  } finally {
+    updatingShopMonitoring.delete(id);
+    if (stillHere()) await perform(loadShop);
+  }
 }
 
 const HOUR_MS = 3600000;
@@ -833,6 +954,7 @@ function route() {
     byId("shop-page-range").textContent = "";
     byId("shop-name").textContent = "店铺商品";
     byId("shop-catalog-status").textContent = "正在加载商品清单";
+    byId("shop-profile").textContent = "";
     byId("shop-observation-times").textContent = "";
     byId("shop-catalog-download").hidden = true;
     byId("shop-catalog-change").hidden = true;
@@ -842,6 +964,9 @@ function route() {
     byId("shop-source").hidden = true;
     byId("manage-shop").disabled = true;
     byId("collect-shop").disabled = true;
+    byId("monitor-shop-all").disabled = true;
+    byId("pause-shop-all").disabled = true;
+    byId("shop-monitor-message").hidden = true;
     byId("shop-catalog-items").replaceChildren();
     return show("shop-page");
   }
@@ -863,12 +988,17 @@ document.querySelector(".brand").addEventListener("click", (event) => {
   event.preventDefault();
   go("pool");
 });
-byId("back-to-shops").addEventListener("click", () => {
-  byId("kind").value = "shop";
-  offset = 0;
-  go("pool");
+byId("shop-back").addEventListener("click", () => {
+  if (history.state?.shopBack) {
+    history.back();
+  } else {
+    history.replaceState(null, "", "#");
+    perform(route);
+  }
 });
 byId("manage-shop").addEventListener("click", () => perform(() => openDetail(shopId)));
+byId("monitor-shop-all").addEventListener("click", () => changeShopMonitoring(shopId, true));
+byId("pause-shop-all").addEventListener("click", () => changeShopMonitoring(shopId, false));
 byId("collect-shop").addEventListener("click", async (event) => {
   const button = event.currentTarget;
   const id = shopId;
@@ -943,25 +1073,47 @@ byId("next").addEventListener("click", () => {
 document.querySelectorAll("dialog .close, dialog .cancel").forEach((button) => {
   button.addEventListener("click", () => button.closest("dialog").close());
 });
-byId("open-import").addEventListener("click", () => byId("import-dialog").showModal());
+document.querySelectorAll("[data-import-kind]").forEach((button) => {
+  button.addEventListener("click", () => {
+    const form = byId("import-form");
+    const kind = button.dataset.importKind;
+    const product = kind === "product";
+    const label = product ? "商品链接" : "店铺链接";
+    if (form.dataset.kind !== kind) {
+      form.reset();
+      byId("import-result").replaceChildren();
+    }
+    form.dataset.kind = kind;
+    byId("import-title").textContent = "添加" + label;
+    byId("import-hint").textContent = product ? "可粘贴单条或多条商品链接，也可以粘贴完整分享文案。"
+      : "可粘贴店铺主页链接。";
+    form.elements.links.placeholder = "粘贴闲鱼或小红书" + label;
+    form.elements.links.setAttribute("aria-label", label);
+    byId("import-dialog").showModal();
+  });
+});
 byId("import-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  const form = event.currentTarget;
+  const kind = form.dataset.kind;
   const button = event.submitter;
   const results = byId("import-result");
+  if (button.disabled) return;
   button.disabled = true;
   results.replaceChildren(line("正在识别链接"));
   try {
-    const {items} = await request("/targets/batch", "POST", {text: event.currentTarget.elements.links.value});
+    const {items} = await request("/targets/batch", "POST", {text: form.elements.links.value, kind});
+    if (items.some((item) => item.status !== "rejected")) changeFilter();
+    if (form.dataset.kind !== kind) return;
     const created = items.filter((item) => item.status === "created").length;
     const existing = items.filter((item) => item.status === "existing").length;
     const restored = items.filter((item) => item.status === "restored").length;
     const rejected = items.filter((item) => item.status === "rejected");
     results.replaceChildren(line("新增 " + created + " · 恢复 " + restored + " · 已存在 " + existing + " · 失败 " + rejected.length),
       ...items.map(importResult));
-    if (!rejected.length) byId("import-form").reset();
-    changeFilter();
+    if (!rejected.length) form.reset();
   } catch (error) {
-    results.replaceChildren(line(error.message));
+    if (form.dataset.kind === kind) results.replaceChildren(line(error.message));
   } finally {
     button.disabled = false;
   }
@@ -987,11 +1139,7 @@ function importResult(item) {
   actions.append(link);
   if (item.kind === "shop") {
     const catalog = node("a", "查看店铺商品");
-    catalog.href = "#shop/" + item.id;
-    catalog.addEventListener("click", () => {
-      byId("import-dialog").close();
-      if (location.hash === catalog.hash) perform(route);
-    });
+    linkToShop(catalog, item.id, () => byId("import-dialog").close());
     actions.append(catalog);
   } else {
     const reading = item.reading;

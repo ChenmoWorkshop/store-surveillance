@@ -1,20 +1,70 @@
 import re
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unicodedata import normalize
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 
 MAX_CATALOG_ITEMS = 2000
 
+LISTING_LABELS = {"active": "在售", "sold": "已售／售罄", "delisted": "已下架",
+                  "removed_violation": "违规删除", "unavailable": "链接不可用"}
+
+
+def public_date(value):
+    """Keep the precision supplied by the source and normalize complete timestamps."""
+    if not isinstance(value, (int, str)) or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            day = date.fromisoformat(text)
+            today = datetime.now(timezone(timedelta(hours=8))).date()
+            return text if date(1990, 1, 1) <= day <= today else None
+        if re.fullmatch(r"\d{10}|\d{13}", text):
+            instant = datetime.fromtimestamp(int(text) / (1000 if len(text) == 13 else 1), timezone.utc)
+        else:
+            instant = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if instant.tzinfo is None:
+                return None
+        if instant.year >= 1990 and instant <= datetime.now(timezone.utc):
+            return instant.astimezone(timezone.utc).isoformat(timespec="seconds")
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
+PublicDate = Annotated[str | None, BeforeValidator(public_date)]
+
+
+def listing_state_from_text(value):
+    if not isinstance(value, str):
+        return None
+    text = value.strip().rstrip("。！!")
+    text = re.sub(r"^(?:该|此)?(?:商品|宝贝)", "", text).strip()
+    return {
+        "在线": "active", "在售": "active", "正常售卖": "active",
+        "已售": "sold", "已售出": "sold", "已售罄": "sold", "已抢光": "sold", "售罄": "sold",
+        "已下架": "delisted", "下架": "delisted",
+        "因违规已被删除": "removed_violation", "因违规被删除": "removed_violation",
+        "因违规已被移除": "removed_violation", "因违规被移除": "removed_violation",
+        "已被平台违规下架": "removed_violation", "因违规已下架": "removed_violation",
+        "因违规被下架": "removed_violation", "因违规被平台下架": "removed_violation",
+        "不存在": "unavailable", "已删除": "unavailable", "已被删除": "unavailable",
+        "已下架或不存在": "unavailable",
+    }.get(text)
+
 
 class CatalogItem(BaseModel):
     id: str = Field(pattern=r"^(?:[0-9]{5,24}|[a-f0-9]{24})$")
+    sku_id: str | None = Field(None, pattern=r"^[a-f0-9]{24}$")
     title: str = Field(min_length=1, max_length=200)
     price_fen: int | None = Field(None, ge=0, le=10**10, strict=True)
     raw_sales: str | None = Field(None, max_length=100)
     want_count: int | None = Field(None, ge=0, le=10**12, strict=True)
+    listed_at: PublicDate = None
 
 
 class ShopCatalog(BaseModel):
@@ -35,12 +85,22 @@ class Reading(BaseModel):
     exact_sales: int | None = Field(None, ge=0, le=10**12)
     want_count: int | None = Field(None, ge=0, le=10**12, strict=True)
     price_fen: int | None = Field(None, ge=0, le=10**10)
-    listing_state: Literal["active", "sold", "delisted"] | None = None
+    listing_state: Literal["active", "sold", "delisted", "removed_violation", "unavailable"] | None = None
     price_label: Literal["券后价", "到手价", "活动价"] | None = None
     cover_url: str | None = Field(None, max_length=2048)
     official_title: str | None = Field(None, max_length=2048)
     shop_name: str | None = Field(None, max_length=256)
+    follower_count: int | None = Field(None, ge=0, le=10**12, strict=True)
+    shop_opened_at: PublicDate = None
+    listed_at: PublicDate = None
     shop_catalog: ShopCatalog | None = None
+
+    @field_validator("follower_count", mode="before")
+    @classmethod
+    def normalize_follower_count(cls, value):
+        if isinstance(value, str) and re.fullmatch(r"\d{1,13}", value):
+            value = int(value)
+        return value if type(value) is int and 0 <= value <= 10**12 else None
 
     @model_validator(mode="after")
     def check_metrics(self):
@@ -55,6 +115,7 @@ class Reading(BaseModel):
                 self.exact_sales = int(match[1])
         if not self.raw_sales and all(value is None for value in (
             self.exact_sales, self.price_fen, self.want_count, self.listing_state, self.shop_catalog,
+            self.follower_count, self.shop_opened_at, self.listed_at,
         )):
             raise ValueError("至少填写一个可核对指标")
         return self
@@ -95,6 +156,7 @@ def xianyu_visible_reading(text):
 
 class ImportLinks(BaseModel):
     text: str = Field(min_length=1, max_length=60000)
+    kind: Literal["product", "shop"] | None = None
 
 
 class TargetPatch(BaseModel):
@@ -105,6 +167,11 @@ class TargetPatch(BaseModel):
 
 class SamplingReview(BaseModel):
     slot: str = Field(max_length=40)
+
+
+class ShopMonitoringChange(BaseModel):
+    enabled: bool
+    item_id: str | None = Field(None, pattern=r"^(?:[0-9]{5,24}|[a-f0-9]{24})$")
 
 
 class Rules(BaseModel):
