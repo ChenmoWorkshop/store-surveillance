@@ -342,7 +342,7 @@ token 来自 cookie `_m_h5_tk` 的下划线前半段
 & ./.venv/Scripts/python.exe -m unittest discover -s tests -q
 ```
 
-22 条，集中在 `tests/test_monitor.py`，覆盖：
+24 条，集中在 `tests/test_monitor.py`，覆盖：
 
 - 链接解析（各平台分享链接、短链、非法域名）
 - 读数校验（模糊销量不能指定精确值、多个价格要报错）

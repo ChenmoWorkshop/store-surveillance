@@ -38,7 +38,7 @@
 | 店铺翻页 | ❌ 未实现 | 只取首批（闲鱼 20 条 / 小红书 6 条），`nextPage` 已读未用 |
 | 数据持久化 | ❌ 未配 | 无持久卷，每次发布清库 |
 | 多用户/权限 | ❌ 未实现 | 单账号 Basic Auth |
-| 自动化测试（前端/采集） | ❌ 缺 | 只有 22 条后端单测 |
+| 自动化测试（前端/采集） | ❌ 缺 | 只有 24 条后端单测 |
 
 ### 线上实例
 
@@ -55,7 +55,7 @@
 # 1. 装环境
 python -m venv .venv
 & ./.venv/Scripts/python.exe -m pip install -r requirements.txt
-& ./.venv/Scripts/python.exe -m unittest discover -s tests -q     # 应当 22 条全过
+& ./.venv/Scripts/python.exe -m unittest discover -s tests -q     # 应当 24 条全过
 
 # 2. 跑起来
 ./start.ps1                                                       # http://127.0.0.1:8765

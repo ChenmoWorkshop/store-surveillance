@@ -57,7 +57,7 @@ monitor/            后端
   xy_browser.py     Playwright 统一启动配置（UA、指纹、代理）
   probe.py          采集通道诊断（/api/v1/admin/probe）
 web/                前端单页（index.html / app.js / style.css）
-tests/              单元测试（22 条）
+tests/              单元测试（24 条）
 tools/              云端备份与恢复脚本
 docs/               技术文档、运维手册、交接清单、历史对话记录
 ```
