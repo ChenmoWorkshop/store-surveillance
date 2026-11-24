@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from monitor import platforms, storage, worker, xhs_product
+from monitor import platforms, storage, worker, xhs_product, xhs_public, xianyu_product, xianyu_shop
 from monitor.models import Reading
 
 
@@ -18,9 +18,10 @@ class MonitorTest(unittest.TestCase):
         db_patch.start()
         self.addCleanup(db_patch.stop)
         storage.init()
-        browser = patch.object(xhs_product, "read_product", side_effect=RuntimeError("测试默认关闭实时浏览器"))
-        browser.start()
-        self.addCleanup(browser.stop)
+        for module in (xhs_product, xianyu_product):
+            live_product = patch.object(module, "read_product", side_effect=RuntimeError("测试默认关闭实时采集"))
+            live_product.start()
+            self.addCleanup(live_product.stop)
         self.slot = datetime(2026, 11, 22, 10, tzinfo=storage.CST)
 
     def target(self, platform, external_id):
@@ -266,6 +267,7 @@ class MonitorTest(unittest.TestCase):
             patch.object(platforms, "provider_configured", return_value=False),
             patch.dict("os.environ", {"MONITOR_XIAOHONGSHU_ENDPOINT": ""}),
             patch.object(platforms, "open_once", side_effect=[TimeoutError(), io.BytesIO(page)]) as fetch,
+            patch.object(xhs_public, "fetch_shop_page", side_effect=TimeoutError()),
             patch.object(worker, "channels", return_value={}),
         ):
             worker.cycle()
@@ -275,6 +277,7 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(result["pagination"]["total"], 1)
         self.assertEqual(result["latest"]["active_count"], 24)
         self.assertTrue(result["latest"]["has_more"])
+        self.assertFalse(result["latest"]["complete"])
         item, = result["products"]
         self.assertEqual((item["price_fen"], item["raw_sales"]), (98, "已售4686"))
 
@@ -295,6 +298,83 @@ class MonitorTest(unittest.TestCase):
         self.assertEqual(repeated["status"], "existing")
         self.assertEqual(target_series(imported["id"], 10)["items"], [])
 
+
+    def test_xhs_shop_collects_desktop_pages_until_count_is_verified(self):
+        seller_id = "a" * 24
+        target = {"external_id": seller_id, "url": "https://www.xiaohongshu.com/shop/" + seller_id}
+        ids = ["b" * 24, "c" * 24, "d" * 24]
+
+        def component(items, total, more, page_number, owner=seller_id):
+            return {"component_name": "DefaultMixCardComponent", "component_data": {
+                "total": total, "has_more": more, "page_param": {"page": page_number},
+                "component_vo_list": [{"default_goods_component_vo": {"base_info": {
+                    "seller_id": owner, "item_id": item, "title": "商品 " + item,
+                }}} for item in items],
+            }}
+
+        first = xhs_public.camel_case(component(ids[:1], 3, True, 1))
+        html = "window.__SETUP_SERVER_STATE__=" + json.dumps({"xhs_shop_home_data": [first]})
+        pages = [component(ids[:2], 3, True, 1), component(ids[1:], 3, True, 2)]
+        pages[1]["component_data"]["component_vo_list"] += (
+            component(["e" * 24], 3, True, 2, owner="f" * 24)["component_data"]["component_vo_list"]
+        )
+
+        def fetch(url, headers, *, data=None):
+            if data is None:
+                self.assertEqual(url, target["url"])
+                return io.BytesIO(html.encode())
+            self.assertEqual(url, xhs_public.SHOP_COMPONENTS_URL)
+            body = json.loads(data)
+            self.assertEqual(body["biz_identity"]["scene"], "shop_pc")
+            self.assertEqual(body["common_param"]["seller_id"], seller_id)
+            page = body["component_param"]["mix_card_component_param"][0]["page_param"]["page"]
+            response = {"success": True, "data": {"components": [pages[page]]}}
+            return io.BytesIO(json.dumps(response).encode())
+
+        with patch.object(platforms, "open_once", side_effect=fetch) as requests:
+            result = platforms.observe_public_shop(target)["shop_catalog"]
+        self.assertEqual(requests.call_count, 3)
+        self.assertEqual([item["id"] for item in result["items"]], ids)
+        self.assertFalse(result["has_more"])
+
+    def test_xianyu_shop_refresh_exports_all_pages_once(self):
+        from monitor.app import import_links, refresh_target, shop_products, target_catalog_csv
+        from monitor.models import ImportLinks
+
+        seller_id = "56789"
+        url = "https://www.goofish.com/personal?userId=" + seller_id
+        head = {"data": {"baseInfo": {"kcUserId": seller_id},
+                         "module": {"tabs": {"item": {"number": 3}}}}}
+
+        def page(ids, more, **paging):
+            return {"data": {"cardList": [{"cardData": {"id": item, "title": "商品 " + item}}
+                                          for item in ids], "nextPage": more} | paging}
+
+        first = page(["10001", "10002"], True, nextPageModel="cursor-1", nextPageNum="opaque")
+        imported, = import_links(ImportLinks(text=url))["items"]
+
+        def observe(target):
+            self.assertEqual(target["external_id"], seller_id)
+
+            def fetch(query):
+                self.assertEqual(query, {"userId": seller_id, "pageSize": 20, "pageNumber": 2,
+                                         "nextPageModel": "cursor-1", "nextPageNum": "opaque"})
+                return page(["10002", "10003"], False)
+
+            return xianyu_shop.collect_catalog(seller_id, head, first, fetch)
+
+        with patch.object(platforms, "observe", side_effect=observe):
+            refresh_target(imported["id"])
+        result = shop_products(imported["id"], page_size=2)
+        self.assertTrue(result["latest"]["complete"])
+        self.assertEqual(result["pagination"]["total"], 3)
+        csv = target_catalog_csv(imported["id"]).body.decode("utf-8-sig")
+        self.assertEqual(csv.count("https://www.goofish.com/item?id="), 3)
+        self.assertIn("https://www.goofish.com/item?id=10003", csv)
+
+        partial = xianyu_shop.collect_catalog(seller_id, head, first, lambda query: first)
+        self.assertTrue(partial["shop_catalog"]["has_more"])
+        self.assertEqual(len(partial["shop_catalog"]["items"]), 2)
 
     def test_shop_products_paginate_a_large_catalog_in_collection_order(self):
         from monitor.app import shop_products

@@ -229,7 +229,7 @@ def metric_column(target):
 
 ### 7.2 小红书店铺（`xhs_public.py`）
 
-直接 GET 公开店铺页，解析 `window.__SETUP_SERVER_STATE__` 里的商品卡片。只返回首批（约 6 条），其余靠 `has_more` 标记缺口。**没有走浏览器**，所以速度快，但页面改版即失效。
+先 GET 公开店铺页，从 `window.__SETUP_SERVER_STATE__` 读取在售数和首批卡片。清单不全时，请求商城公开组件接口的 `shop_pc` 场景，从第 0 页开始，每页 10 件，核对所属店铺并按商品 ID 去重。末页仍可能返回 `hasMore=true`，网页在售数、分页接口总数和去重条数一致时即可确认收齐。如果分页中断，保留采集到的清单并标记缺口。
 
 ### 7.3 闲鱼店铺（`xianyu_shop.py`）— 云端可用
 
@@ -240,7 +240,7 @@ def metric_column(target):
 | `mtop.idle.web.user.page.head` | `34839810` | `module.tabs.item.number` 在售数、`module.base.displayName` 店名、`baseInfo.kcUserId` 校验 |
 | `mtop.idle.web.xyh.item.list` | `34839810` | `cardList[].cardData`：`id` / `title` / `priceInfo.price`，`nextPage` 标记还有下一页 |
 
-`PAGE_SIZE = 20`，只取首页。翻页逻辑尚未实现（`nextPage` 字段已读入但被忽略）。
+`PAGE_SIZE = 20`。沿用卖家主页的商品分组和上一页返回的分页参数读取后续页，按商品 ID 去重。确认收齐需要到达末页，且商品数与卖家主页的在售数一致。
 
 ### 7.4 闲鱼商品（`xianyu_product.py`）— 机房 IP 被风控
 
@@ -342,7 +342,7 @@ token 来自 cookie `_m_h5_tk` 的下划线前半段
 & ./.venv/Scripts/python.exe -m unittest discover -s tests -q
 ```
 
-24 条，集中在 `tests/test_monitor.py`，覆盖：
+测试集中在 `tests/test_monitor.py`，覆盖：
 
 - 链接解析（各平台分享链接、短链、非法域名）
 - 读数校验（模糊销量不能指定精确值、多个价格要报错）
@@ -384,7 +384,7 @@ token 来自 cookie `_m_h5_tk` 的下划线前半段
 按影响排序：
 
 1. **无持久卷** → 每次发布清库（运维层面解决，见 OPERATIONS）
-2. **店铺只采首页** → `nextPage` 已读未用，闲鱼缺 16 条、小红书缺 18 条
+2. **店铺分页依赖平台网页接口** → 访问受限或返回不一致时只能保留已采清单
 3. **`cycle()` 平台硬编码** → 扩展性差
 4. **单账号 Basic Auth** → 无法区分只读/管理权限
 5. **无请求限流** → `/refresh` 可被滥用

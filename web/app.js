@@ -65,6 +65,7 @@ let shopId = null;
 let shopRequest = 0;
 let shopPage = 1;
 let shopPageCount = 1;
+const collectingShops = new Set();
 const pageSize = 50;
 
 function node(tag, value, className) {
@@ -539,6 +540,7 @@ async function loadShop() {
   byId("shop-source").href = target.url;
   byId("shop-source").hidden = false;
   byId("manage-shop").disabled = false;
+  byId("collect-shop").disabled = collectingShops.has(target.id);
   const status = byId("shop-catalog-status");
   const comparisonText = byId("shop-catalog-change");
   const download = byId("shop-catalog-download");
@@ -554,12 +556,14 @@ async function loadShop() {
   byId("shop-page-range").textContent = total
     ? "第 " + (first + 1) + "–" + (first + products.length) + " 条 / 共 " + total + " 条"
     : "共 0 条";
+  let coverage = "";
+  if (latest) {
+    coverage = latest.complete ? "清单已采齐"
+      : total < latest.active_count ? "清单未采齐，尚缺 " + (latest.active_count - total) + " 条链接"
+        : total > latest.active_count ? "商品条数与在售数不一致" : "清单完整性待确认";
+  }
   status.textContent = latest ? time(latest.observed_at) + " · 在售 " + latest.active_count
-    + " · 已采集 " + total + " 条链接"
-    + (total < latest.active_count ? " · 尚缺 " + (latest.active_count - total) + " 条链接"
-      : total > latest.active_count ? " · 与在售数不一致" : "")
-    + (latest.has_more ? " · 公开网页只返回首批商品" : "")
-    : "暂无在售商品采集记录。";
+    + " · 已采集 " + total + " 条链接 · " + coverage : "暂无在售商品采集记录。";
 
   comparisonText.hidden = !comparison;
   if (comparison) {
@@ -569,7 +573,8 @@ async function loadShop() {
         + " 条 · 移出在售列表 " + comparison.removed + " 条";
     }
   }
-  download.hidden = total === 0;
+  download.hidden = total === 0 && !latest?.complete;
+  download.textContent = latest?.complete ? "导出商品链接 CSV" : "导出已采商品 CSV";
   download.href = "/api/v1/targets/" + target.id + "/catalog.csv";
   if (products.length) {
     list.replaceChildren(...products.map((item, index) => shopProductRow(item, first + index + 1, xhs)));
@@ -831,8 +836,12 @@ function route() {
     byId("shop-observation-times").textContent = "";
     byId("shop-catalog-download").hidden = true;
     byId("shop-catalog-change").hidden = true;
+    const collectionMessage = byId("shop-collection-message");
+    collectionMessage.textContent = collectingShops.has(shopId) ? "正在采集店铺商品…" : "";
+    collectionMessage.hidden = !collectionMessage.textContent;
     byId("shop-source").hidden = true;
     byId("manage-shop").disabled = true;
+    byId("collect-shop").disabled = true;
     byId("shop-catalog-items").replaceChildren();
     return show("shop-page");
   }
@@ -860,6 +869,29 @@ byId("back-to-shops").addEventListener("click", () => {
   go("pool");
 });
 byId("manage-shop").addEventListener("click", () => perform(() => openDetail(shopId)));
+byId("collect-shop").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const id = shopId;
+  const notice = byId("shop-collection-message");
+  const stillHere = () => activeView === "shop-page" && shopId === id;
+  collectingShops.add(id);
+  button.disabled = true;
+  notice.hidden = false;
+  notice.textContent = "正在采集店铺商品…";
+  try {
+    await request("/targets/" + id + "/refresh", "POST");
+    if (stillHere()) {
+      shopPage = 1;
+      await loadShop();
+      if (stillHere()) notice.hidden = true;
+    }
+  } catch (error) {
+    if (stillHere()) notice.textContent = error.message;
+  } finally {
+    collectingShops.delete(id);
+    if (stillHere()) button.disabled = false;
+  }
+});
 
 function changeShopPage(page) {
   shopPage = Math.max(1, Math.min(page, shopPageCount));
@@ -953,7 +985,15 @@ function importResult(item) {
   link.rel = "noopener noreferrer";
   const actions = node("div", null, "detail-actions");
   actions.append(link);
-  if (item.kind === "product") {
+  if (item.kind === "shop") {
+    const catalog = node("a", "查看店铺商品");
+    catalog.href = "#shop/" + item.id;
+    catalog.addEventListener("click", () => {
+      byId("import-dialog").close();
+      if (location.hash === catalog.hash) perform(route);
+    });
+    actions.append(catalog);
+  } else {
     const reading = item.reading;
     const shown = item.source_preview || reading || item.catalog_preview;
     if (shown) {
