@@ -3,11 +3,13 @@
 [![tests](https://github.com/ChenmoWorkshop/store-surveillance/actions/workflows/tests.yml/badge.svg)](https://github.com/ChenmoWorkshop/store-surveillance/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-监控闲鱼、小红书的商品与店铺，按北京时间整点自动采样，记录想要数／展示销量／在售数的变化，按规则推送异动提醒。
+当前线上版本使用 ChatGPT Sites、Cloudflare Workers 和 D1 SQL，源码和部署说明见 [Sites 版](sites/README.md)。
+
+以下介绍 Python 版。它监控闲鱼、小红书的商品与店铺，按北京时间整点自动采样，记录想要数、展示销量和在售数的变化，并支持异动提醒。
 
 - 后端：Python 3.11 + FastAPI + SQLite，常驻进程自带调度器，浏览器关掉也继续采
 - 前端：原生 JS 单页，无构建步骤，由后端直接托管
-- 部署：Docker 单镜像，已跑在腾讯云 CloudBase 云托管
+- 部署：Docker 单镜像，支持腾讯云 CloudBase 云托管
 
 ## 当前采集能力
 
