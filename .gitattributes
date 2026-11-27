@@ -1,2 +1,7 @@
 * text=auto eol=lf
 *.png binary
+
+# Windows 脚本必须保持 CRLF，否则 cmd 的 goto 标签可能失效
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf
